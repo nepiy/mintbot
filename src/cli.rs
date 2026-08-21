@@ -9,7 +9,7 @@ use std::path::PathBuf;
 )]
 pub struct Cli {
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -26,6 +26,11 @@ pub enum Command {
     Run {
         #[arg(long)]
         config: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    #[command(alias = "interactive")]
+    Start {
         #[arg(long)]
         dry_run: bool,
     },

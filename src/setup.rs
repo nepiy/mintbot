@@ -22,11 +22,32 @@ struct ManualControlInfo {
 }
 
 pub fn run_wizard(output: &Path) -> Result<PathBuf> {
+    let config = prompt_config(true)?;
+    let name = config.name.clone();
+    let path = if output.extension().is_some() {
+        output.to_path_buf()
+    } else {
+        output.join(format!("{}.json", slugify(&name)))
+    };
+    config.save_pretty(&path)?;
+    println!("\nSaved: {}", path.display());
+    println!("Private keys are loaded only from PRIVATE_KEY and are never stored in this file.");
+    Ok(path)
+}
+
+pub fn prompt_interactive_config() -> Result<MintConfig> {
+    prompt_config(false)
+}
+
+fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     println!("NFT Mint Setup\n");
     let name = ask("Collection name", "Example NFT")?;
-    let chain_id = ask("Chain ID", "1")?
-        .parse()
-        .map_err(|err| BotError::Config(format!("invalid chain ID: {err}")))?;
+    let chain_id = ask(
+        "Chain ID (4663 = Robinhood mainnet)",
+        if allow_manual { "1" } else { "4663" },
+    )?
+    .parse()
+    .map_err(|err| BotError::Config(format!("invalid chain ID: {err}")))?;
     let contract_address = ask(
         "Contract address",
         "0x0000000000000000000000000000000000000000",
@@ -45,15 +66,37 @@ pub fn run_wizard(output: &Path) -> Result<PathBuf> {
     .map(ToOwned::to_owned)
     .collect();
     let price_per_nft = ask("Price per NFT (native currency)", "0.005")?;
+    let proof = ask(
+        "Merkle proof (comma-separated bytes32 values; blank if none)",
+        "",
+    )?;
+    let proof = if proof.trim().is_empty() {
+        None
+    } else {
+        Some(
+            proof
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect(),
+        )
+    };
     let gas_limit = ask(
-        "Prepared gas limit (required when a closed sale makes estimation revert)",
+        "Trusted gas limit (required if the sale is currently closed)",
         "200000",
     )?
     .parse::<u64>()
     .map_err(|err| BotError::Config(format!("invalid gas limit: {err}")))?;
-    println!(
-        "\nSelect trigger:\n1. Blockchain timestamp\n2. Boolean sale state\n3. Numeric sale phase\n4. Contract event\n5. Manual"
-    );
+    if allow_manual {
+        println!(
+            "\nSelect trigger:\n1. Blockchain timestamp\n2. Boolean sale state\n3. Numeric sale phase\n4. Contract event\n5. Manual"
+        );
+    } else {
+        println!(
+            "\nSelect automatic trigger:\n1. Blockchain timestamp\n2. Boolean sale state (recommended)\n3. Numeric sale phase\n4. Contract event"
+        );
+    }
     let trigger_choice = ask("Trigger", "2")?;
     let trigger = match trigger_choice.trim() {
         "1" => MintTrigger::BlockTimestamp {
@@ -75,17 +118,14 @@ pub fn run_wizard(output: &Path) -> Result<PathBuf> {
             signature: ask("Event signature", "PublicSaleStarted()")?,
             confirmations: Some(0),
         },
-        "5" => MintTrigger::Manual,
+        "5" if allow_manual => MintTrigger::Manual,
         _ => {
-            return Err(BotError::Config(
-                "trigger must be a number from 1 to 5".to_string(),
-            ));
+            return Err(BotError::Config(if allow_manual {
+                "trigger must be a number from 1 to 5".to_string()
+            } else {
+                "trigger must be a number from 1 to 4".to_string()
+            }));
         }
-    };
-    let path = if output.extension().is_some() {
-        output.to_path_buf()
-    } else {
-        output.join(format!("{}.json", slugify(&name)))
     };
     let config = MintConfig {
         name,
@@ -96,7 +136,7 @@ pub fn run_wizard(output: &Path) -> Result<PathBuf> {
         mint: MintCallConfig {
             function,
             arguments,
-            proof: None,
+            proof,
             price_per_nft,
         },
         trigger,
@@ -104,16 +144,17 @@ pub fn run_wizard(output: &Path) -> Result<PathBuf> {
             gas_limit: Some(gas_limit),
             ..GasConfig::default()
         },
-        nonce_strategy: NonceStrategy::Preloaded,
+        nonce_strategy: if allow_manual {
+            NonceStrategy::Preloaded
+        } else {
+            NonceStrategy::JustBeforeTrigger
+        },
         replacement: Default::default(),
         expected_start_time: None,
         confirmations: 1,
     };
     config.validate()?;
-    config.save_pretty(&path)?;
-    println!("\nSaved: {}", path.display());
-    println!("Private keys are loaded only from PRIVATE_KEY and are never stored in this file.");
-    Ok(path)
+    Ok(config)
 }
 
 pub async fn bind_manual_control(config_path: &Path) -> Result<(mpsc::Receiver<()>, PathBuf)> {

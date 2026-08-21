@@ -127,6 +127,28 @@ Replacement transactions, when enabled, reuse the original nonce, bump the appli
 
 ## Commands
 
+### Interactive launch
+
+For a one-off mint, you do not need to prepare a JSON file first. Start the interactive flow:
+
+```bash
+./target/release/nft-mint-bot
+```
+
+The explicit equivalent is:
+
+```bash
+./target/release/nft-mint-bot start
+```
+
+It asks for the collection, chain, contract address, quantity, mint function/arguments, price, proof, gas limit, and an automatic trigger. The recommended boolean sale-state trigger checks the contract on each new block: if the sale is already open when the bot starts, it submits on the next block; if the sale opens later, it waits and submits when the state becomes true. Choose the blockchain-timestamp trigger when the contract does not expose a sale-state view and you know the Unix start time.
+
+The interactive configuration is held in memory and is not written to a JSON file. Use `--dry-run` to verify the trigger path without signing or broadcasting:
+
+```bash
+./target/release/nft-mint-bot start --dry-run
+```
+
 Interactive setup keeps the private key out of the generated JSON:
 
 ```bash

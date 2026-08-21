@@ -4,7 +4,7 @@ use crate::{
     error::{BotError, Result},
     metrics::LatencyMetrics,
     rpc::{RpcClients, simulate_call},
-    setup::{bind_manual_control, cleanup_manual_control},
+    setup::{bind_manual_control, cleanup_manual_control, prompt_interactive_config},
     state::{AtomicBotState, BotState},
     trigger::{TriggerEngine, TriggerObservation},
     wallet::{LoadedWallet, short_address},
@@ -34,6 +34,19 @@ pub struct PreparedTransaction {
 
 pub async fn run_bot(config_path: PathBuf, dry_run: bool) -> Result<()> {
     let config = MintConfig::load(&config_path)?;
+    run_bot_with_config(config, Some(config_path), dry_run).await
+}
+
+pub async fn run_interactive(dry_run: bool) -> Result<()> {
+    let config = prompt_interactive_config()?;
+    run_bot_with_config(config, None, dry_run).await
+}
+
+async fn run_bot_with_config(
+    config: MintConfig,
+    control_identity: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
     let state = AtomicBotState::default();
     state.store(BotState::LoadingConfiguration);
     let wallet = LoadedWallet::from_env()?;
@@ -69,7 +82,13 @@ pub async fn run_bot(config_path: PathBuf, dry_run: bool) -> Result<()> {
 
     let manual_enabled = matches!(config.trigger, MintTrigger::Manual);
     let (mut manual_rx, control_path) = if manual_enabled {
-        let (receiver, path) = bind_manual_control(&config_path).await?;
+        let identity = control_identity.as_deref().ok_or_else(|| {
+            BotError::ManualTrigger(
+                "interactive mode requires an automatic trigger; use `run --config ...` for manual control"
+                    .to_string(),
+            )
+        })?;
+        let (receiver, path) = bind_manual_control(identity).await?;
         (receiver, Some(path))
     } else {
         let (_sender, receiver) = tokio::sync::mpsc::channel(1);

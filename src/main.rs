@@ -4,7 +4,7 @@ use nft_mint_bot::{
     cli::{Cli, Command},
     error::Result,
     rpc::RpcClients,
-    run_bot, run_simulation,
+    run_bot, run_interactive, run_simulation,
     setup::{run_wizard, send_manual_trigger},
 };
 
@@ -21,14 +21,16 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Setup { output } => {
+        Some(Command::Setup { output }) => {
             run_wizard(&output)?;
         }
-        Command::RpcTest => run_rpc_test().await?,
-        Command::Simulate { config } => run_simulation(config).await?,
-        Command::Run { config, dry_run } => run_bot(config, dry_run).await?,
-        Command::Benchmark { iterations } => benchmark::run(iterations).await?,
-        Command::Trigger { config } => send_manual_trigger(&config).await?,
+        Some(Command::RpcTest) => run_rpc_test().await?,
+        Some(Command::Simulate { config }) => run_simulation(config).await?,
+        Some(Command::Run { config, dry_run }) => run_bot(config, dry_run).await?,
+        Some(Command::Start { dry_run }) => run_interactive(dry_run).await?,
+        Some(Command::Benchmark { iterations }) => benchmark::run(iterations).await?,
+        Some(Command::Trigger { config }) => send_manual_trigger(&config).await?,
+        None => run_interactive(false).await?,
     }
     Ok(())
 }

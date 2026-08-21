@@ -12,4 +12,4 @@ pub mod wallet;
 
 mod bot;
 
-pub use bot::{run_bot, run_simulation};
+pub use bot::{run_bot, run_interactive, run_simulation};
