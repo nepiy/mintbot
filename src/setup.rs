@@ -64,16 +64,22 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     let quantity = ask("Mint quantity", "1")?
         .parse()
         .map_err(|err| BotError::Config(format!("invalid quantity: {err}")))?;
-    let function = ask("Mint function", "mint(uint256)")?;
-    let arguments = ask(
-        "Mint arguments (comma-separated; placeholders: $quantity, $wallet, $proof)",
-        "$quantity",
-    )?
-    .split(',')
-    .map(str::trim)
-    .filter(|value| !value.is_empty())
-    .map(ToOwned::to_owned)
-    .collect();
+    let (function, arguments) = if allow_manual {
+        let function = ask("Mint function", "mint(uint256)")?;
+        let arguments = ask(
+            "Mint arguments (comma-separated; placeholders: $quantity, $wallet, $proof)",
+            "$quantity",
+        )?
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+        (function, arguments)
+    } else {
+        println!("Mint call: mint(uint256) with quantity as the only argument");
+        ("mint(uint256)".to_string(), vec!["$quantity".to_string()])
+    };
     let price_per_nft = ask("Price per NFT (native currency)", "0.005")?;
     let proof = ask(
         "Merkle proof (comma-separated bytes32 values; blank if none)",

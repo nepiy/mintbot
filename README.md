@@ -141,7 +141,7 @@ The explicit equivalent is:
 ./target/release/nft-mint-bot start
 ```
 
-It targets Robinhood Chain mainnet automatically (chain ID `4663`), so it does not ask for a chain ID or collection name. It asks for the contract address, quantity, mint function/arguments, price, proof, gas limit, and an automatic trigger. The recommended boolean sale-state trigger checks the contract on each new block: if the sale is already open when the bot starts, it submits on the next block; if the sale opens later, it waits and submits when the state becomes true. Choose the blockchain-timestamp trigger when the contract does not expose a sale-state view and you know the Unix start time.
+It targets Robinhood Chain mainnet automatically (chain ID `4663`), so it does not ask for a chain ID, collection name, mint function, or arguments. The interactive default is `mint(uint256)` with `$quantity`; this works only for collections exposing that exact method. It asks for the contract address, quantity, price, proof, gas limit, and an automatic trigger. Collections using a different mint signature must use the JSON/advanced workflow. The recommended boolean sale-state trigger checks the contract on each new block: if the sale is already open when the bot starts, it submits on the next block; if the sale opens later, it waits and submits when the state becomes true. Choose the blockchain-timestamp trigger when the contract does not expose a sale-state view and you know the Unix start time.
 
 The interactive configuration is held in memory and is not written to a JSON file. Use `--dry-run` to verify the trigger path without signing or broadcasting:
 
