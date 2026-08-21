@@ -1,5 +1,8 @@
 use crate::{
-    config::{GasConfig, MintCallConfig, MintConfig, MintTrigger, NonceStrategy},
+    config::{
+        GasConfig, MintCallConfig, MintConfig, MintTrigger, NonceStrategy,
+        ROBINHOOD_MAINNET_CHAIN_ID,
+    },
     error::{BotError, Result},
 };
 use alloy::primitives::keccak256;
@@ -42,12 +45,14 @@ pub fn prompt_interactive_config() -> Result<MintConfig> {
 fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     println!("NFT Mint Setup\n");
     let name = ask("Collection name", "Example NFT")?;
-    let chain_id = ask(
-        "Chain ID (4663 = Robinhood mainnet)",
-        if allow_manual { "1" } else { "4663" },
-    )?
-    .parse()
-    .map_err(|err| BotError::Config(format!("invalid chain ID: {err}")))?;
+    let chain_id = if allow_manual {
+        ask("Chain ID", "1")?
+            .parse()
+            .map_err(|err| BotError::Config(format!("invalid chain ID: {err}")))?
+    } else {
+        println!("Network: Robinhood Chain mainnet (chain ID {ROBINHOOD_MAINNET_CHAIN_ID})");
+        ROBINHOOD_MAINNET_CHAIN_ID
+    };
     let contract_address = ask(
         "Contract address",
         "0x0000000000000000000000000000000000000000",

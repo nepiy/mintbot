@@ -3,6 +3,8 @@ use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
+pub const ROBINHOOD_MAINNET_CHAIN_ID: u64 = 4663;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MintConfig {
     pub name: String,
