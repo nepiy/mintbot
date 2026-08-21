@@ -1,7 +1,7 @@
 use crate::{
     config::{
         GasConfig, MintCallConfig, MintConfig, MintTrigger, NonceStrategy,
-        ROBINHOOD_MAINNET_CHAIN_ID,
+        ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_MAINNET_CHAIN_ID,
     },
     error::{BotError, Result},
 };
@@ -97,12 +97,19 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
                 .collect(),
         )
     };
-    let gas_limit = ask(
-        "Trusted gas limit (required if the sale is currently closed)",
-        "200000",
-    )?
-    .parse::<u64>()
-    .map_err(|err| BotError::Config(format!("invalid gas limit: {err}")))?;
+    let gas_limit = if allow_manual {
+        ask(
+            "Prepared gas limit (required when a closed sale makes estimation revert)",
+            &ROBINHOOD_DEFAULT_GAS_LIMIT.to_string(),
+        )?
+        .parse::<u64>()
+        .map_err(|err| BotError::Config(format!("invalid gas limit: {err}")))?
+    } else {
+        println!(
+            "Gas limit: {ROBINHOOD_DEFAULT_GAS_LIMIT} (automatic default; advanced config can override)"
+        );
+        ROBINHOOD_DEFAULT_GAS_LIMIT
+    };
     if allow_manual {
         println!(
             "\nSelect trigger:\n1. Blockchain timestamp\n2. Boolean sale state\n3. Numeric sale phase\n4. Contract event\n5. Manual"

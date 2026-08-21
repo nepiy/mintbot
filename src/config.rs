@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
 
 pub const ROBINHOOD_MAINNET_CHAIN_ID: u64 = 4663;
+pub const ROBINHOOD_DEFAULT_GAS_LIMIT: u64 = 200_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MintConfig {
