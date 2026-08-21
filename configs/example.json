@@ -1,0 +1,32 @@
+{
+  "name": "Example NFT (edit before use)",
+  "chain_id": 31337,
+  "native_currency": "ETH",
+  "contract_address": "0x0000000000000000000000000000000000000000",
+  "quantity": 1,
+  "mint": {
+    "function": "mint(uint256)",
+    "arguments": ["$quantity"],
+    "price_per_nft": "0"
+  },
+  "trigger": {
+    "type": "boolean_contract_state",
+    "function": "publicSaleActive() returns (bool)",
+    "expected_value": true
+  },
+  "gas": {
+    "mode": "auto",
+    "multiplier": 1.15,
+    "gas_limit": 200000,
+    "max_total_gas_cost_native": "0.01"
+  },
+  "nonce_strategy": "preloaded",
+  "replacement": {
+    "enabled": false,
+    "after_blocks": 2,
+    "fee_multiplier": 1.15,
+    "max_attempts": 2
+  },
+  "expected_start_time": null,
+  "confirmations": 1
+}
