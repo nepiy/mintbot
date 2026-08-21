@@ -13,6 +13,8 @@ pub struct MintConfig {
     #[serde(default)]
     pub native_currency: Option<String>,
     pub contract_address: String,
+    #[serde(default)]
+    pub opensea_drop_slug: Option<String>,
     pub quantity: u64,
     pub mint: MintCallConfig,
     pub trigger: MintTrigger,
@@ -200,6 +202,29 @@ impl MintConfig {
             ));
         }
         let _ = self.contract()?;
+        if let Some(slug) = self.opensea_drop_slug.as_deref() {
+            let slug = slug.trim();
+            if slug.is_empty()
+                || !slug.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+            {
+                return Err(BotError::Config(
+                    "opensea_drop_slug must contain only letters, numbers, `-`, and `_`"
+                        .to_string(),
+                ));
+            }
+            if !matches!(self.trigger, MintTrigger::BlockTimestamp { .. }) {
+                return Err(BotError::Config(
+                    "OpenSea mode requires a block_timestamp trigger".to_string(),
+                ));
+            }
+            if self.quantity > 100 {
+                return Err(BotError::Config(
+                    "OpenSea mint quantity must be between 1 and 100".to_string(),
+                ));
+            }
+        }
         if self.quantity == 0 {
             return Err(BotError::Config(
                 "quantity must be greater than zero".to_string(),

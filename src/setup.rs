@@ -61,9 +61,56 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         "Contract address",
         "0x0000000000000000000000000000000000000000",
     )?;
+    let opensea_drop_slug = if allow_manual {
+        None
+    } else {
+        let slug = ask("OpenSea drop slug (blank for direct contract mint)", "")?;
+        (!slug.trim().is_empty()).then_some(slug)
+    };
     let quantity = ask("Mint quantity", "1")?
         .parse()
         .map_err(|err| BotError::Config(format!("invalid quantity: {err}")))?;
+
+    if let Some(opensea_drop_slug) = opensea_drop_slug {
+        let stage_start = ask(
+            "Earliest OpenSea stage time (Unix seconds; 0 to auto-use active/upcoming stages)",
+            "0",
+        )?
+        .parse()
+        .map_err(|err| BotError::Config(format!("invalid stage start time: {err}")))?;
+        let config = MintConfig {
+            name: "Robinhood NFT".to_string(),
+            chain_id,
+            native_currency: None,
+            contract_address,
+            opensea_drop_slug: Some(opensea_drop_slug),
+            quantity,
+            mint: MintCallConfig {
+                function: "mint(uint256)".to_string(),
+                arguments: vec!["$quantity".to_string()],
+                proof: None,
+                // OpenSea returns the exact payable value for the active stage.
+                price_per_nft: "0".to_string(),
+            },
+            trigger: MintTrigger::BlockTimestamp {
+                timestamp: stage_start,
+            },
+            gas: GasConfig {
+                gas_limit: Some(ROBINHOOD_DEFAULT_GAS_LIMIT),
+                ..GasConfig::default()
+            },
+            nonce_strategy: NonceStrategy::JustBeforeTrigger,
+            replacement: Default::default(),
+            expected_start_time: None,
+            confirmations: 1,
+        };
+        config.validate()?;
+        println!(
+            "OpenSea mode: GTD/FCFS stage and price are selected by the Drops API when the stage is active."
+        );
+        return Ok(config);
+    }
+
     let (function, arguments) = if allow_manual {
         let function = ask("Mint function", "mint(uint256)")?;
         let arguments = ask(
@@ -154,6 +201,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         chain_id,
         native_currency: None,
         contract_address,
+        opensea_drop_slug: None,
         quantity,
         mint: MintCallConfig {
             function,

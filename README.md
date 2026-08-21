@@ -4,6 +4,8 @@
 
 It does not automate a browser, click a website, use MetaMask, or bypass allowlists, signatures, queues, CAPTCHA, wallet limits, or other contract/platform controls. Any proof or authorization must be supplied by the user in the collection configuration.
 
+For OpenSea Drops, the optional Drops API mode asks OpenSea to build the eligible mint transaction for the connected wallet. OpenSea applies the active GTD/FCFS/public stage rules and returns the exact contract, calldata, and payment value for the wallet to sign; it does not bypass eligibility.
+
 ## Supported networks
 
 The implementation is network-agnostic: Ethereum, Base, Arbitrum, Optimism, Polygon, BNB Chain, Avalanche C-Chain, Robinhood Chain, local Anvil, and other EVM JSON-RPC networks can be used by changing the chain ID and endpoints. No network-specific transaction logic is hardcoded. Solana is intentionally not mixed into this engine; a future Solana backend should implement a separate chain abstraction.
@@ -51,6 +53,7 @@ WS_RPC_URL=wss://...
 HTTP_RPC_URL=https://...
 BACKUP_RPC_URL=https://...
 BROADCAST_RPC_URLS=https://rpc-two.example,https://rpc-three.example
+OPENSEA_API_KEY=
 RPC_TIMEOUT_MS=5000
 BROADCAST_TIMEOUT_MS=3000
 RUST_LOG=nft_mint_bot=info
@@ -141,7 +144,9 @@ The explicit equivalent is:
 ./target/release/nft-mint-bot start
 ```
 
-It targets Robinhood Chain mainnet automatically (chain ID `4663`), so it does not ask for a chain ID, collection name, mint function, arguments, or gas limit. The interactive defaults are `mint(uint256)` with `$quantity` and a `200000` gas limit; these work only for collections exposing that exact method and fitting within that limit. It asks for the contract address, quantity, price, proof, and an automatic trigger. Collections using a different mint signature or requiring a higher gas limit must use the JSON/advanced workflow. The recommended boolean sale-state trigger checks the contract on each new block: if the sale is already open when the bot starts, it submits on the next block; if the sale opens later, it waits and submits when the state becomes true. Choose the blockchain-timestamp trigger when the contract does not expose a sale-state view and you know the Unix start time.
+It targets Robinhood Chain mainnet automatically (chain ID `4663`), so it does not ask for a chain ID, collection name, mint function, arguments, or gas limit. The normal contract flow asks for the contract address, quantity, price, proof, and an automatic trigger. Its defaults are `mint(uint256)` with `$quantity` and a `200000` gas limit; collections using a different signature or requiring a higher limit must use the JSON/advanced workflow.
+
+To use an OpenSea GTD/FCFS/public drop, set `OPENSEA_API_KEY` in `.env` and enter the collection’s OpenSea drop slug when prompted. The bot fetches the drop’s stage schedule, so enter `0` to monitor the active and upcoming stages automatically, or enter a Unix timestamp to ignore stages before that time. It can be started before the first stage and remains armed; when a stage starts it calls `POST /api/v2/drops/{slug}/mint` with your wallet and quantity. OpenSea then chooses the first active stage for which that wallet is eligible and returns the ready-to-sign transaction. If you are not GTD-eligible, a 422 response advances the monitor to the next scheduled stage, such as FCFS, without requiring a Merkle proof. The OpenSea mode does not ask for price, Merkle proof, or mint function because OpenSea supplies the payable value and calldata.
 
 The interactive configuration is held in memory and is not written to a JSON file. Use `--dry-run` to verify the trigger path without signing or broadcasting:
 
@@ -186,6 +191,8 @@ For a manual trigger, start the bot with a `manual` trigger and run this from an
 ```
 
 The control channel binds only to localhost and writes a mode-`0600` short-lived control file under the system temporary directory. The command authenticates with a random one-time token from that file, the listener accepts exactly one valid trigger, and the file is removed when the monitor exits.
+
+OpenSea API mode still requires the contract address: the bot compares OpenSea’s returned transaction target with that address before signing. The API key is read from `OPENSEA_API_KEY`, is never logged or stored in the mint configuration, and is held only in memory.
 
 ## Local Anvil test
 
@@ -245,4 +252,4 @@ This version intentionally does not include a mempool watcher, private relay sub
 
 ## Official API references
 
-The provider and transaction paths follow the current Alloy provider, ABI, and transaction APIs: [Alloy RPC providers](https://alloy.rs/rpc-providers/introduction/), [Alloy static and dynamic ABI](https://alloy.rs/guides/static-dynamic-abi-in-alloy/), and [Alloy transactions](https://alloy.rs/transactions/introduction/). Tokio’s signal handling is documented at [tokio::signal::ctrl_c](https://docs.rs/tokio/latest/tokio/signal/fn.ctrl_c.html).
+The OpenSea integration follows [Build mint transaction data](https://docs.opensea.io/reference/build_drop_mint_transaction) and [Mint from a Drop Programmatically](https://docs.opensea.io/docs/mint-from-a-drop). The provider and transaction paths follow the current Alloy provider, ABI, and transaction APIs: [Alloy RPC providers](https://alloy.rs/rpc-providers/introduction/), [Alloy static and dynamic ABI](https://alloy.rs/guides/static-dynamic-abi-in-alloy/), and [Alloy transactions](https://alloy.rs/transactions/introduction/). Tokio’s signal handling is documented at [tokio::signal::ctrl_c](https://docs.rs/tokio/latest/tokio/signal/fn.ctrl_c.html).

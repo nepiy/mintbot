@@ -78,6 +78,16 @@ impl TriggerEngine {
         &self.trigger
     }
 
+    pub fn set_block_timestamp(&mut self, timestamp: u64) -> Result<()> {
+        let MintTrigger::BlockTimestamp { timestamp: current } = &mut self.trigger else {
+            return Err(BotError::Trigger(
+                "OpenSea stage scheduling requires a block timestamp trigger".to_string(),
+            ));
+        };
+        *current = timestamp;
+        Ok(())
+    }
+
     pub fn observe_event(
         &mut self,
         block_number: Option<u64>,

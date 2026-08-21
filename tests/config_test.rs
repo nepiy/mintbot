@@ -67,3 +67,22 @@ fn rejects_unsafe_replacement_settings_before_arming() {
     config.replacement.fee_multiplier = 1.15;
     assert!(config.validate().is_ok());
 }
+
+#[test]
+fn validates_opensea_drop_slug() {
+    let mut config: MintConfig = serde_json::from_str(
+        r#"{
+          "name": "OpenSea drop",
+          "chain_id": 4663,
+          "contract_address": "0x0000000000000000000000000000000000000001",
+          "opensea_drop_slug": "robinhood-drop-2026",
+          "quantity": 1,
+          "mint": { "function": "mint(uint256)" },
+          "trigger": { "type": "block_timestamp", "timestamp": 0 }
+        }"#,
+    )
+    .expect("valid JSON shape");
+    assert!(config.validate().is_ok());
+    config.opensea_drop_slug = Some("not/a-safe-slug".to_string());
+    assert!(config.validate().is_err());
+}

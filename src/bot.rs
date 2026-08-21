@@ -3,6 +3,7 @@ use crate::{
     config::{GasMode, MintConfig, MintTrigger, NonceStrategy, parse_gwei, parse_native_amount},
     error::{BotError, Result},
     metrics::LatencyMetrics,
+    opensea::{OpenSeaClient, OpenSeaStage},
     rpc::{RpcClients, simulate_call},
     setup::{bind_manual_control, cleanup_manual_control, prompt_interactive_config},
     state::{AtomicBotState, BotState},
@@ -20,7 +21,7 @@ use alloy::{
 use futures_util::StreamExt;
 use std::{
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Clone)]
@@ -30,6 +31,7 @@ pub struct PreparedTransaction {
     pub mint_value: U256,
     pub gas_limit: u64,
     pub fee_cap: u128,
+    pub opensea_hydrated: bool,
 }
 
 pub async fn run_bot(config_path: PathBuf, dry_run: bool) -> Result<()> {
@@ -43,7 +45,7 @@ pub async fn run_interactive(dry_run: bool) -> Result<()> {
 }
 
 async fn run_bot_with_config(
-    config: MintConfig,
+    mut config: MintConfig,
     control_identity: Option<PathBuf>,
     dry_run: bool,
 ) -> Result<()> {
@@ -73,9 +75,23 @@ async fn run_bot_with_config(
 
     state.store(BotState::Preparing);
     let mut prepared = prepare_transaction(&config, &rpc, &wallet).await?;
+    let opensea_stages = if config.opensea_drop_slug.is_some() {
+        load_opensea_stage_schedule(&config).await?
+    } else {
+        Vec::new()
+    };
+    if let Some(stage) = opensea_stages.first() {
+        config.trigger = MintTrigger::BlockTimestamp {
+            timestamp: stage.start_time,
+        };
+    }
     let mut trigger_engine = TriggerEngine::new(&config)?;
     println!("Wallet balance: OK");
-    println!("Calldata: PREPARED ({} bytes)", prepared.calldata.len());
+    if config.opensea_drop_slug.is_some() {
+        println!("OpenSea transaction: DEFERRED until the selected stage is active");
+    } else {
+        println!("Calldata: PREPARED ({} bytes)", prepared.calldata.len());
+    }
     println!("Signer: READY");
     println!("Gas strategy: READY");
     println!("Nonce strategy: READY");
@@ -113,6 +129,8 @@ async fn run_bot_with_config(
         dry_run,
         dynamic_fields_healthy: true,
         last_seen_block,
+        opensea_stages,
+        opensea_stage_index: 0,
     };
     let result = monitor_until_trigger(&mut monitor, streams).await;
     if let Some(path) = control_path {
@@ -127,7 +145,10 @@ pub async fn run_simulation(config_path: PathBuf) -> Result<()> {
     let mut rpc = RpcClients::connect_from_env().await?;
     rpc.validate_chain(&config).await?;
     rpc.validate_contract(&config).await?;
-    let prepared = prepare_transaction(&config, &rpc, &wallet).await?;
+    let mut prepared = prepare_transaction(&config, &rpc, &wallet).await?;
+    if config.opensea_drop_slug.is_some() {
+        hydrate_opensea_transaction(&config, &rpc, &wallet, &mut prepared).await?;
+    }
     println!("SIMULATION");
     println!("--------------------------------");
     println!("Collection: {}", config.name);
@@ -156,19 +177,30 @@ pub async fn prepare_transaction(
     wallet: &LoadedWallet,
 ) -> Result<PreparedTransaction> {
     let contract = config.contract()?;
-    let calldata = encode_mint(
-        &config.mint,
-        config.quantity,
-        wallet.address,
-        config.mint.proof.as_deref(),
-    )?;
-    let mint_value = config.mint_value_wei()?;
+    if config.opensea_drop_slug.is_some() {
+        // Fail before arming if the API credential is missing rather than
+        // discovering it only when the stage opens.
+        let _ = OpenSeaClient::from_env()?;
+    }
+    let (calldata, mint_value) = if config.opensea_drop_slug.is_some() {
+        // OpenSea only returns valid calldata once an eligible stage is active.
+        // Build a safe zero-value placeholder so the bot can arm in advance.
+        (Vec::new(), U256::ZERO)
+    } else {
+        let calldata = encode_mint(
+            &config.mint,
+            config.quantity,
+            wallet.address,
+            config.mint.proof.as_deref(),
+        )?;
+        (calldata.bytes, config.mint_value_wei()?)
+    };
     let nonce = rpc.preload_nonce(wallet.address).await?;
     let mut request = TransactionRequest::default()
         .with_from(wallet.address)
         .with_to(contract)
         .with_chain_id(config.chain_id)
-        .with_input(calldata.bytes.clone())
+        .with_input(calldata.clone())
         .with_value(mint_value);
 
     let gas_limit = if let Some(limit) = config.gas.gas_limit {
@@ -243,11 +275,106 @@ pub async fn prepare_transaction(
         .await?;
     Ok(PreparedTransaction {
         request,
-        calldata: calldata.bytes,
+        calldata,
         mint_value,
         gas_limit,
         fee_cap,
+        opensea_hydrated: false,
     })
+}
+
+async fn load_opensea_stage_schedule(config: &MintConfig) -> Result<Vec<OpenSeaStage>> {
+    let Some(drop_slug) = config.opensea_drop_slug.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let minimum_start = match config.trigger {
+        MintTrigger::BlockTimestamp { timestamp } => timestamp,
+        _ => {
+            return Err(BotError::Config(
+                "OpenSea mode requires a block timestamp trigger".to_string(),
+            ));
+        }
+    };
+    let stages = OpenSeaClient::from_env()?.get_stages(drop_slug).await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut stages = stages
+        .into_iter()
+        .filter(|stage| {
+            if minimum_start > 0 {
+                stage.start_time >= minimum_start
+            } else {
+                stage.end_time.is_none_or(|end_time| end_time >= now)
+            }
+        })
+        .collect::<Vec<_>>();
+    stages.sort_by_key(|stage| stage.start_time);
+    if stages.is_empty() {
+        return Err(BotError::Config(
+            "OpenSea returned no upcoming or active stages matching the selected start time"
+                .to_string(),
+        ));
+    }
+    Ok(stages)
+}
+
+async fn hydrate_opensea_transaction(
+    config: &MintConfig,
+    rpc: &RpcClients,
+    wallet: &LoadedWallet,
+    prepared: &mut PreparedTransaction,
+) -> Result<()> {
+    let Some(drop_slug) = config.opensea_drop_slug.as_deref() else {
+        return Ok(());
+    };
+    let client = OpenSeaClient::from_env()?;
+    let mint = client
+        .build_mint(drop_slug, wallet.address, config.quantity)
+        .await?;
+    let expected_contract = config.contract()?;
+    if mint.target != expected_contract {
+        return Err(BotError::Transaction(format!(
+            "OpenSea returned target contract {}, but configuration specifies {}",
+            mint.target, expected_contract
+        )));
+    }
+
+    let mut request = TransactionRequest::default()
+        .with_from(wallet.address)
+        .with_to(mint.target)
+        .with_chain_id(config.chain_id)
+        .with_input(mint.calldata.clone())
+        .with_value(mint.value);
+    if let Some(nonce) = prepared.request.nonce {
+        request.set_nonce(nonce);
+    }
+    if let Some(gas_price) = prepared.request.gas_price {
+        request.set_gas_price(gas_price);
+    }
+    if let Some(max_fee) = prepared.request.max_fee_per_gas {
+        request.set_max_fee_per_gas(max_fee);
+    }
+    if let Some(priority) = prepared.request.max_priority_fee_per_gas {
+        request.set_max_priority_fee_per_gas(priority);
+    }
+
+    let estimated_gas = rpc.estimate_gas(request.clone()).await.map_err(|err| {
+        BotError::Transaction(format!(
+            "OpenSea transaction gas estimation failed after the stage opened: {err}"
+        ))
+    })?;
+    let configured_limit = config.gas.gas_limit.unwrap_or_default();
+    let gas_limit = scale_u64(estimated_gas.max(configured_limit), config.gas.multiplier)?;
+    request.set_gas_limit(gas_limit);
+    prepared.request = request;
+    prepared.calldata = mint.calldata;
+    prepared.mint_value = mint.value;
+    prepared.gas_limit = gas_limit;
+    prepared.opensea_hydrated = true;
+    refresh_transaction_fields(config, rpc, wallet, prepared).await?;
+    Ok(())
 }
 
 async fn validate_transaction_budget(
@@ -294,6 +421,8 @@ struct MonitorContext<'a> {
     dry_run: bool,
     dynamic_fields_healthy: bool,
     last_seen_block: Option<u64>,
+    opensea_stages: Vec<OpenSeaStage>,
+    opensea_stage_index: usize,
 }
 
 enum MonitorStreams {
@@ -388,8 +517,16 @@ async fn monitor_until_trigger(
                     }
                     _ => None,
                 };
+                let backfill_can_execute = if backfill_ready.is_some() {
+                    match ensure_transaction_ready(context).await {
+                        Ok(ready) => ready,
+                        Err(err) => return Err(err),
+                    }
+                } else {
+                    false
+                };
                 if let Some(received) = backfill_ready
-                    && ensure_dynamic_fields(context).await
+                    && backfill_can_execute
                     && context.state.try_acquire_trigger()
                 {
                     let validated = Instant::now();
@@ -453,7 +590,12 @@ async fn monitor_block_stream(
                     .await
                 {
                     Ok(TriggerObservation::Ready) => {
-                        if ensure_dynamic_fields(context).await {
+                        match ensure_transaction_ready(context).await {
+                            Err(err) => return Err(MonitorFailure::Execution(err)),
+                            Ok(false) => continue,
+                            Ok(true) => {}
+                        }
+                        {
                             let validated = Instant::now();
                             if !context.state.try_acquire_trigger() {
                                 continue;
@@ -516,8 +658,14 @@ async fn monitor_event_stream(
                     .await;
                 match observation {
                     Ok(TriggerObservation::Ready) => {
-                        if event_is_canonical(context, filter).await
-                            && ensure_dynamic_fields(context).await
+                        if !event_is_canonical(context, filter).await {
+                            continue;
+                        }
+                        match ensure_transaction_ready(context).await {
+                            Err(err) => return Err(MonitorFailure::Execution(err)),
+                            Ok(false) => continue,
+                            Ok(true) => {}
+                        }
                         {
                             let validated = Instant::now();
                             if !context.state.try_acquire_trigger() {
@@ -559,7 +707,15 @@ async fn monitor_event_stream(
                     log.block_hash,
                     log.removed,
                 );
-                if observation == TriggerObservation::Ready && ensure_dynamic_fields(context).await {
+                if observation != TriggerObservation::Ready {
+                    continue;
+                }
+                match ensure_transaction_ready(context).await {
+                    Err(err) => return Err(MonitorFailure::Execution(err)),
+                    Ok(false) => continue,
+                    Ok(true) => {}
+                }
+                {
                     let validated = Instant::now();
                     if !context.state.try_acquire_trigger() {
                         continue;
@@ -605,6 +761,15 @@ async fn monitor_manual(
                 return Err(MonitorFailure::Execution(BotError::Transaction(
                     "could not refresh transaction fields for manual trigger".to_string(),
                 )));
+            }
+            match ensure_transaction_ready(context).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(MonitorFailure::Execution(BotError::Transaction(
+                        "could not prepare transaction for manual trigger".to_string(),
+                    )));
+                }
+                Err(err) => return Err(MonitorFailure::Execution(err)),
             }
             let validated = Instant::now();
             if context.state.try_acquire_trigger() {
@@ -710,6 +875,55 @@ async fn ensure_dynamic_fields(context: &mut MonitorContext<'_>) -> bool {
     context.dynamic_fields_healthy
 }
 
+async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bool> {
+    if !ensure_dynamic_fields(context).await {
+        return Ok(false);
+    }
+    if context.config.opensea_drop_slug.is_some() && !context.prepared.opensea_hydrated {
+        let hydration = hydrate_opensea_transaction(
+            context.config,
+            context.rpc,
+            context.wallet,
+            context.prepared,
+        )
+        .await;
+        if let Err(err) = hydration {
+            let stage_unavailable = matches!(
+                &err,
+                BotError::OpenSeaApi {
+                    status: 409 | 422,
+                    ..
+                }
+            );
+            if stage_unavailable && advance_opensea_stage(context)? {
+                return Ok(false);
+            }
+            return Err(err);
+        }
+    }
+    Ok(true)
+}
+
+fn advance_opensea_stage(context: &mut MonitorContext<'_>) -> Result<bool> {
+    let Some(next_stage) = context
+        .opensea_stages
+        .get(context.opensea_stage_index.saturating_add(1))
+        .cloned()
+    else {
+        return Ok(false);
+    };
+    context.opensea_stage_index = context.opensea_stage_index.saturating_add(1);
+    context
+        .trigger_engine
+        .set_block_timestamp(next_stage.start_time)?;
+    context.prepared.opensea_hydrated = false;
+    println!(
+        "[INFO] OpenSea stage unavailable; waiting for {} at Unix timestamp {}",
+        next_stage.label, next_stage.start_time
+    );
+    Ok(true)
+}
+
 async fn refresh_transaction_fields(
     config: &MintConfig,
     rpc: &RpcClients,
@@ -764,6 +978,10 @@ async fn execute_transaction(
         state.store(BotState::Stopped);
         metrics.print();
         return Ok(MonitorOutcome::Done);
+    }
+
+    if config.opensea_drop_slug.is_some() && !prepared.opensea_hydrated {
+        hydrate_opensea_transaction(config, rpc, wallet, prepared).await?;
     }
 
     metrics.finalization_started = Some(Instant::now());
@@ -1024,7 +1242,12 @@ fn print_armed(
     println!("======================================");
     println!("Trigger: {}", trigger_label(&config.trigger));
     println!("Quantity: {}", config.quantity);
-    println!("Mint value: {} wei", prepared.mint_value);
+    if let Some(slug) = config.opensea_drop_slug.as_deref() {
+        println!("OpenSea drop: {slug}");
+        println!("Mint value: fetched from OpenSea when the stage is active");
+    } else {
+        println!("Mint value: {} wei", prepared.mint_value);
+    }
     println!("Wallet: {}", short_address(wallet.address));
     println!("Gas limit: {}", prepared.gas_limit);
     println!("Maximum fee cap: {} wei/gas", prepared.fee_cap);

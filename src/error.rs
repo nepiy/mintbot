@@ -41,6 +41,9 @@ pub enum BotError {
     #[error("transaction error: {0}")]
     Transaction(String),
 
+    #[error("OpenSea API error ({status}): {message}")]
+    OpenSeaApi { status: u16, message: String },
+
     #[error("manual trigger control error: {0}")]
     ManualTrigger(String),
 
