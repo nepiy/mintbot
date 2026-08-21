@@ -64,8 +64,28 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     let opensea_drop_slug = if allow_manual {
         None
     } else {
-        let slug = ask("OpenSea drop slug (blank for direct contract mint)", "")?;
-        (!slug.trim().is_empty()).then_some(slug)
+        let api_key_configured = std::env::var("OPENSEA_API_KEY")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+        let slug = if api_key_configured {
+            ask(
+                "OpenSea drop slug (enter `direct` only for a custom contract mint)",
+                "",
+            )?
+        } else {
+            ask("OpenSea drop slug (blank for direct contract mint)", "")?
+        };
+        if api_key_configured && slug.trim().is_empty() {
+            return Err(BotError::Config(
+                "OPENSEA_API_KEY is configured, so enter the OpenSea drop slug or type `direct`"
+                    .to_string(),
+            ));
+        }
+        if slug.eq_ignore_ascii_case("direct") {
+            None
+        } else {
+            (!slug.trim().is_empty()).then_some(slug)
+        }
     };
     let quantity = ask("Mint quantity", "1")?
         .parse()
