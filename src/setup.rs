@@ -44,7 +44,11 @@ pub fn prompt_interactive_config() -> Result<MintConfig> {
 
 fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     println!("NFT Mint Setup\n");
-    let name = ask("Collection name", "Example NFT")?;
+    let name = if allow_manual {
+        ask("Collection name", "Example NFT")?
+    } else {
+        "Robinhood NFT".to_string()
+    };
     let chain_id = if allow_manual {
         ask("Chain ID", "1")?
             .parse()
