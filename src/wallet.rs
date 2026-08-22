@@ -1,9 +1,10 @@
 use crate::error::{BotError, Result};
 use alloy::{
     network::{EthereumWallet, NetworkWallet},
+    primitives::keccak256,
     signers::local::PrivateKeySigner,
 };
-use std::env;
+use std::{env, fs::OpenOptions};
 use zeroize::Zeroizing;
 
 #[derive(Clone)]
@@ -34,7 +35,7 @@ impl LoadedWallet {
         let signer: PrivateKeySigner = private_key
             .as_str()
             .parse::<PrivateKeySigner>()
-            .map_err(|err| BotError::Wallet(format!("{err:?}")))?;
+            .map_err(|_| BotError::Wallet("PRIVATE_KEY has an invalid format".to_string()))?;
         let address = signer.address();
         Ok(Self {
             address,
@@ -52,6 +53,40 @@ impl LoadedWallet {
         )
         .await
         .map_err(|err| BotError::Transaction(format!("local signing failed: {err}")))
+    }
+}
+
+pub struct WalletNonceLock {
+    _file: std::fs::File,
+}
+
+impl WalletNonceLock {
+    pub async fn acquire(address: alloy::primitives::Address) -> Result<Self> {
+        let digest = keccak256(address.as_slice());
+        let path = std::env::temp_dir().join(format!(
+            "nft-mint-bot-wallet-{}.lock",
+            hex::encode(&digest[..12])
+        ));
+        let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
+            let mut options = OpenOptions::new();
+            options.read(true).write(true).create(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let file = options.open(path)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            file.lock()?;
+            Ok(file)
+        })
+        .await
+        .map_err(|err| BotError::Wallet(format!("nonce lock task failed: {err}")))??;
+        Ok(Self { _file: file })
     }
 }
 

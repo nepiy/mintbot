@@ -1,4 +1,14 @@
 .env
+.env.*
+!.env.example
 target/
 *.trigger
 .DS_Store
+*.key
+*.pem
+*.p12
+*.seed
+*credentials*.json
+*secrets*.json
+configs/*.json
+!configs/example.json

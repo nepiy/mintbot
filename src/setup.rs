@@ -1,7 +1,8 @@
 use crate::{
     config::{
         GasConfig, MintCallConfig, MintConfig, MintTrigger, NonceStrategy,
-        ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_MAINNET_CHAIN_ID,
+        ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
+        ROBINHOOD_MAINNET_CHAIN_ID,
     },
     error::{BotError, Result},
 };
@@ -61,9 +62,91 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         "Contract address",
         "0x0000000000000000000000000000000000000000",
     )?;
+    let opensea_drop_slug = if allow_manual {
+        None
+    } else {
+        let api_key_configured = std::env::var("OPENSEA_API_KEY")
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty());
+        let slug = if api_key_configured {
+            ask(
+                "OpenSea drop slug (enter `direct` only for a custom contract mint)",
+                "",
+            )?
+        } else {
+            ask("OpenSea drop slug (blank for direct contract mint)", "")?
+        };
+        if api_key_configured && slug.trim().is_empty() {
+            return Err(BotError::Config(
+                "OPENSEA_API_KEY is configured, so enter the OpenSea drop slug or type `direct`"
+                    .to_string(),
+            ));
+        }
+        if slug.eq_ignore_ascii_case("direct") {
+            None
+        } else {
+            (!slug.trim().is_empty()).then_some(slug)
+        }
+    };
     let quantity = ask("Mint quantity", "1")?
         .parse()
         .map_err(|err| BotError::Config(format!("invalid quantity: {err}")))?;
+
+    if let Some(opensea_drop_slug) = opensea_drop_slug {
+        let require_zero_value = ask_yes_no(
+            "Require free mint (stop if OpenSea returns any payment)",
+            true,
+        )?;
+        let max_price_per_nft = if require_zero_value {
+            Some("0".to_string())
+        } else {
+            Some(ask(
+                "Maximum price per NFT (bot aborts if OpenSea returns more)",
+                "0.001",
+            )?)
+        };
+        let stage_start = ask(
+            "Earliest OpenSea stage time (Unix seconds; 0 to auto-use active/upcoming stages)",
+            "0",
+        )?
+        .parse()
+        .map_err(|err| BotError::Config(format!("invalid stage start time: {err}")))?;
+        let config = MintConfig {
+            name: "Robinhood NFT".to_string(),
+            chain_id,
+            native_currency: None,
+            contract_address,
+            opensea_drop_slug: Some(opensea_drop_slug),
+            require_zero_value,
+            max_price_per_nft,
+            quantity,
+            mint: MintCallConfig {
+                function: "mint(uint256)".to_string(),
+                arguments: vec!["$quantity".to_string()],
+                proof: None,
+                // OpenSea returns the exact payable value for the active stage.
+                price_per_nft: "0".to_string(),
+            },
+            trigger: MintTrigger::BlockTimestamp {
+                timestamp: stage_start,
+            },
+            gas: GasConfig {
+                gas_limit: Some(ROBINHOOD_DEFAULT_GAS_LIMIT),
+                max_total_gas_cost_native: Some(ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE.to_string()),
+                ..GasConfig::default()
+            },
+            nonce_strategy: NonceStrategy::JustBeforeTrigger,
+            replacement: Default::default(),
+            expected_start_time: None,
+            confirmations: 1,
+        };
+        config.validate()?;
+        println!(
+            "OpenSea mode: GTD/FCFS stage and price are selected by the Drops API when the stage is active."
+        );
+        return Ok(config);
+    }
+
     let (function, arguments) = if allow_manual {
         let function = ask("Mint function", "mint(uint256)")?;
         let arguments = ask(
@@ -154,6 +237,9 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         chain_id,
         native_currency: None,
         contract_address,
+        opensea_drop_slug: None,
+        require_zero_value: false,
+        max_price_per_nft: None,
         quantity,
         mint: MintCallConfig {
             function,
@@ -164,6 +250,8 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         trigger,
         gas: GasConfig {
             gas_limit: Some(gas_limit),
+            max_total_gas_cost_native: (!allow_manual)
+                .then(|| ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE.to_string()),
             ..GasConfig::default()
         },
         nonce_strategy: if allow_manual {
@@ -287,6 +375,18 @@ fn ask(label: &str, default: &str) -> Result<String> {
     } else {
         value.to_string()
     })
+}
+
+fn ask_yes_no(label: &str, default: bool) -> Result<bool> {
+    let default_text = if default { "yes" } else { "no" };
+    let value = ask(&format!("{label} (yes/no)"), default_text)?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Err(BotError::Config(format!(
+            "{label} must be answered yes or no"
+        ))),
+    }
 }
 
 fn slugify(value: &str) -> String {

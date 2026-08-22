@@ -1,6 +1,7 @@
 use crate::{
     config::MintConfig,
     error::{BotError, Result},
+    security::summarize_rpc_error,
 };
 use alloy::{
     eips::{BlockId, eip1559::Eip1559Estimation},
@@ -11,6 +12,7 @@ use alloy::{
     rpc::types::{Filter, Header, Log, TransactionReceipt, TransactionRequest},
 };
 use futures_util::{StreamExt, stream::FuturesUnordered};
+use reqwest::Url;
 use std::{
     env,
     sync::Arc,
@@ -44,7 +46,7 @@ impl RpcClients {
         let ws_url = required_env("WS_RPC_URL")?;
         let request_timeout = duration_from_env("RPC_TIMEOUT_MS", 5_000)?;
         let broadcast_timeout = duration_from_env("BROADCAST_TIMEOUT_MS", 3_000)?;
-        let http = connect_http(&http_url).await?;
+        let http = connect_http("HTTP_RPC_URL", &http_url).await?;
         let ws_started = Instant::now();
         let ws = tokio::time::timeout(request_timeout, connect_ws(&ws_url))
             .await
@@ -53,7 +55,10 @@ impl RpcClients {
 
         let mut broadcast = vec![("primary".to_string(), http.clone())];
         if let Some(backup) = optional_env("BACKUP_RPC_URL") {
-            broadcast.push(("backup".to_string(), connect_http(&backup).await?));
+            broadcast.push((
+                "backup".to_string(),
+                connect_http("BACKUP_RPC_URL", &backup).await?,
+            ));
         }
         if let Some(extra) = optional_env("BROADCAST_RPC_URLS") {
             for (index, url) in extra
@@ -62,7 +67,10 @@ impl RpcClients {
                 .filter(|item| !item.is_empty())
                 .enumerate()
             {
-                broadcast.push((format!("broadcast-{index}"), connect_http(url).await?));
+                broadcast.push((
+                    format!("broadcast-{index}"),
+                    connect_http("BROADCAST_RPC_URLS", url).await?,
+                ));
             }
         }
         let broadcast = Arc::new(broadcast);
@@ -86,7 +94,10 @@ impl RpcClients {
             .await
             .map_err(|_| BotError::Rpc("reconnected WebSocket chain check timed out".to_string()))?
             .map_err(|err| {
-                BotError::Rpc(format!("reconnected WebSocket chain check failed: {err}"))
+                BotError::Rpc(format!(
+                    "reconnected WebSocket chain check failed: {}",
+                    summarize_rpc_error(&err.to_string())
+                ))
             })?;
         if chain_id != expected_chain_id {
             return Err(BotError::ChainMismatch {
@@ -101,7 +112,12 @@ impl RpcClients {
         let ws_chain_id = tokio::time::timeout(self.request_timeout, self.ws.get_chain_id())
             .await
             .map_err(|_| BotError::Rpc("WebSocket chain ID check timed out".to_string()))?
-            .map_err(|err| BotError::Rpc(format!("WebSocket chain ID check failed: {err}")))?;
+            .map_err(|err| {
+                BotError::Rpc(format!(
+                    "WebSocket chain ID check failed: {}",
+                    summarize_rpc_error(&err.to_string())
+                ))
+            })?;
         if ws_chain_id != config.chain_id {
             return Err(BotError::ChainMismatch {
                 configured: config.chain_id,
@@ -121,7 +137,7 @@ impl RpcClients {
                     )));
                 }
                 Ok(Err(err)) => {
-                    tracing::warn!(provider = %name, error = %err, "excluding unavailable RPC provider");
+                    tracing::warn!(provider = %name, error = %summarize_rpc_error(&err.to_string()), "excluding unavailable RPC provider");
                 }
                 Err(_) => {
                     tracing::warn!(provider = %name, "excluding RPC provider after health-check timeout");
@@ -150,6 +166,22 @@ impl RpcClients {
         if codes.iter().all(|code| code.is_empty()) {
             return Err(BotError::MissingContract { address: contract });
         }
+        if codes.iter().any(|code| code.is_empty()) {
+            return Err(BotError::Rpc(
+                "RPC providers disagree about whether the configured contract is deployed"
+                    .to_string(),
+            ));
+        }
+        let expected_hash = keccak256(&codes[0]);
+        if codes
+            .iter()
+            .skip(1)
+            .any(|code| keccak256(code) != expected_hash)
+        {
+            return Err(BotError::Rpc(
+                "RPC providers returned different bytecode for the configured contract".to_string(),
+            ));
+        }
         Ok(())
     }
 
@@ -158,7 +190,12 @@ impl RpcClients {
             .await
             .map_err(|_| BotError::Rpc("block subscription timed out".to_string()))?
             .map(|subscription| subscription.into_stream())
-            .map_err(|err| BotError::Rpc(format!("block subscription failed: {err}")))
+            .map_err(|err| {
+                BotError::Rpc(format!(
+                    "block subscription failed: {}",
+                    summarize_rpc_error(&err.to_string())
+                ))
+            })
     }
 
     pub async fn subscribe_logs(&self, filter: &Filter) -> Result<SubscriptionStream<Log>> {
@@ -166,7 +203,12 @@ impl RpcClients {
             .await
             .map_err(|_| BotError::Rpc("log subscription timed out".to_string()))?
             .map(|subscription| subscription.into_stream())
-            .map_err(|err| BotError::Rpc(format!("log subscription failed: {err}")))
+            .map_err(|err| {
+                BotError::Rpc(format!(
+                    "log subscription failed: {}",
+                    summarize_rpc_error(&err.to_string())
+                ))
+            })
     }
 
     pub async fn preload_nonce(&self, address: Address) -> Result<u64> {
@@ -289,7 +331,9 @@ impl RpcClients {
         while let Some((name, result)) = calls.next().await {
             match result {
                 Ok(Ok(value)) => return Ok(value),
-                Ok(Err(err)) => failures.push(format!("{name}: {err}")),
+                Ok(Err(err)) => {
+                    failures.push(format!("{name}: {}", summarize_rpc_error(&err.to_string())))
+                }
                 Err(_) => failures.push(format!("{name}: timed out")),
             }
         }
@@ -320,7 +364,9 @@ impl RpcClients {
         while let Some((name, result)) = calls.next().await {
             match result {
                 Ok(Ok(value)) => values.push(value),
-                Ok(Err(err)) => failures.push(format!("{name}: {err}")),
+                Ok(Err(err)) => {
+                    failures.push(format!("{name}: {}", summarize_rpc_error(&err.to_string())))
+                }
                 Err(_) => failures.push(format!("{name}: timed out")),
             }
         }
@@ -399,7 +445,7 @@ impl RpcClients {
                     return Ok((expected_hash, elapsed));
                 }
                 Ok(Err(err)) => {
-                    tracing::warn!(provider = %name, error = %err, "broadcast endpoint rejected transaction");
+                    tracing::warn!(provider = %name, error = %summarize_rpc_error(&err.to_string()), "broadcast endpoint rejected transaction");
                 }
                 Err(_) => tracing::warn!(provider = %name, "broadcast endpoint timed out"),
             }
@@ -429,19 +475,48 @@ pub struct LatencySummary {
     pub failed: usize,
 }
 
-async fn connect_http(url: &str) -> Result<DynProvider<Ethereum>> {
-    let parsed = url
-        .parse()
-        .map_err(|err| BotError::Config(format!("invalid HTTP_RPC_URL `{url}`: {err}")))?;
+async fn connect_http(name: &str, url: &str) -> Result<DynProvider<Ethereum>> {
+    let parsed = validate_rpc_url(name, url, false)?;
     Ok(ProviderBuilder::new().connect_http(parsed).erased())
 }
 
 async fn connect_ws(url: &str) -> Result<DynProvider<Ethereum>> {
+    let parsed = validate_rpc_url("WS_RPC_URL", url, true)?;
     ProviderBuilder::new()
-        .connect_ws(WsConnect::new(url.to_string()).with_max_retries(10))
+        .connect_ws(WsConnect::new(parsed.to_string()).with_max_retries(10))
         .await
         .map(|provider| provider.erased())
-        .map_err(|err| BotError::Rpc(err.to_string()))
+        .map_err(|_| {
+            BotError::Rpc(
+                "WebSocket connection failed; verify WS_RPC_URL and its credentials".to_string(),
+            )
+        })
+}
+
+fn validate_rpc_url(name: &str, value: &str, websocket: bool) -> Result<Url> {
+    let parsed = value
+        .parse::<Url>()
+        .map_err(|_| BotError::Config(format!("{name} is not a valid URL")))?;
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(BotError::Config(format!(
+            "{name} must not embed username/password credentials in the URL"
+        )));
+    }
+    let loopback = parsed
+        .host_str()
+        .is_some_and(|host| matches!(host, "localhost" | "127.0.0.1" | "::1"));
+    let secure = if websocket {
+        parsed.scheme() == "wss" || (parsed.scheme() == "ws" && loopback)
+    } else {
+        parsed.scheme() == "https" || (parsed.scheme() == "http" && loopback)
+    };
+    if !secure {
+        let required = if websocket { "wss://" } else { "https://" };
+        return Err(BotError::Config(format!(
+            "{name} must use {required}; insecure transport is allowed only for loopback development nodes"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn required_env(name: &str) -> Result<String> {
@@ -541,5 +616,27 @@ mod tests {
         assert!(is_known_transaction("already known"));
         assert!(is_known_transaction("Known transaction: 0xabc"));
         assert!(!is_known_transaction("nonce too low"));
+    }
+
+    #[test]
+    fn requires_encrypted_rpc_transport_except_on_loopback() {
+        assert!(validate_rpc_url("HTTP_RPC_URL", "https://rpc.example", false).is_ok());
+        assert!(validate_rpc_url("WS_RPC_URL", "wss://rpc.example", true).is_ok());
+        assert!(validate_rpc_url("HTTP_RPC_URL", "http://rpc.example", false).is_err());
+        assert!(validate_rpc_url("WS_RPC_URL", "ws://rpc.example", true).is_err());
+        assert!(validate_rpc_url("HTTP_RPC_URL", "http://127.0.0.1:8545", false).is_ok());
+        assert!(validate_rpc_url("WS_RPC_URL", "ws://localhost:8545", true).is_ok());
+    }
+
+    #[test]
+    fn rejects_rpc_urls_with_userinfo_credentials() {
+        assert!(
+            validate_rpc_url(
+                "HTTP_RPC_URL",
+                "https://username:password@rpc.example",
+                false
+            )
+            .is_err()
+        );
     }
 }

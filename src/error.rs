@@ -35,11 +35,19 @@ pub enum BotError {
     )]
     GasLimitExceeded { estimated: String, maximum: String },
 
+    #[error(
+        "mint price safety limit exceeded: OpenSea returned {returned} wei > configured maximum {maximum} wei"
+    )]
+    MintValueExceeded { returned: String, maximum: String },
+
     #[error("trigger error: {0}")]
     Trigger(String),
 
     #[error("transaction error: {0}")]
     Transaction(String),
+
+    #[error("OpenSea API error ({status}): {message}")]
+    OpenSeaApi { status: u16, message: String },
 
     #[error("manual trigger control error: {0}")]
     ManualTrigger(String),
