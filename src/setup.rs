@@ -92,6 +92,10 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         .map_err(|err| BotError::Config(format!("invalid quantity: {err}")))?;
 
     if let Some(opensea_drop_slug) = opensea_drop_slug {
+        let require_zero_value = ask_yes_no(
+            "Require free mint (stop if OpenSea returns any payment)",
+            true,
+        )?;
         let stage_start = ask(
             "Earliest OpenSea stage time (Unix seconds; 0 to auto-use active/upcoming stages)",
             "0",
@@ -104,6 +108,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
             native_currency: None,
             contract_address,
             opensea_drop_slug: Some(opensea_drop_slug),
+            require_zero_value,
             quantity,
             mint: MintCallConfig {
                 function: "mint(uint256)".to_string(),
@@ -222,6 +227,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         native_currency: None,
         contract_address,
         opensea_drop_slug: None,
+        require_zero_value: false,
         quantity,
         mint: MintCallConfig {
             function,
@@ -355,6 +361,18 @@ fn ask(label: &str, default: &str) -> Result<String> {
     } else {
         value.to_string()
     })
+}
+
+fn ask_yes_no(label: &str, default: bool) -> Result<bool> {
+    let default_text = if default { "yes" } else { "no" };
+    let value = ask(&format!("{label} (yes/no)"), default_text)?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => Err(BotError::Config(format!(
+            "{label} must be answered yes or no"
+        ))),
+    }
 }
 
 fn slugify(value: &str) -> String {

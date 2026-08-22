@@ -15,6 +15,8 @@ pub struct MintConfig {
     pub contract_address: String,
     #[serde(default)]
     pub opensea_drop_slug: Option<String>,
+    #[serde(default)]
+    pub require_zero_value: bool,
     pub quantity: u64,
     pub mint: MintCallConfig,
     pub trigger: MintTrigger,

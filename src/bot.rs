@@ -340,6 +340,12 @@ async fn hydrate_opensea_transaction(
             mint.target, expected_contract
         )));
     }
+    if config.require_zero_value && !mint.value.is_zero() {
+        return Err(BotError::Transaction(format!(
+            "OpenSea returned a nonzero mint value of {} wei; free-mint price guard refused to sign",
+            mint.value
+        )));
+    }
 
     let mut request = TransactionRequest::default()
         .with_from(wallet.address)
@@ -1245,6 +1251,9 @@ fn print_armed(
     if let Some(slug) = config.opensea_drop_slug.as_deref() {
         println!("OpenSea drop: {slug}");
         println!("Mint value: fetched from OpenSea when the stage is active");
+        if config.require_zero_value {
+            println!("Price guard: REQUIRED FREE MINT (nonzero value will abort)");
+        }
     } else {
         println!("Mint value: {} wei", prepared.mint_value);
     }
