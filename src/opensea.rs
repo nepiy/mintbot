@@ -1,13 +1,18 @@
-use crate::error::{BotError, Result};
+use crate::{
+    error::{BotError, Result},
+    security::sanitize_external_text,
+};
 use alloy::primitives::{Address, U256};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use reqwest::{Client, Response};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use zeroize::Zeroizing;
 
 const OPENSEA_API_BASE: &str = "https://api.opensea.io/api/v2";
+const MAX_RESPONSE_BYTES: u64 = 1_048_576;
+const MAX_CALLDATA_BYTES: usize = 262_144;
 
 #[derive(Debug, Clone)]
 pub struct OpenSeaMintTransaction {
@@ -86,29 +91,21 @@ impl OpenSeaClient {
             .json(&body)
             .send()
             .await
-            .map_err(|err| BotError::Transaction(format!("OpenSea API request failed: {err}")))?;
+            .map_err(|_| BotError::Transaction("OpenSea API request failed".to_string()))?;
         let status = response.status();
         if !status.is_success() {
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|err| format!("could not read response body: {err}"));
             return Err(BotError::OpenSeaApi {
                 status: status.as_u16(),
-                message: truncate_message(&message),
+                message:
+                    "request rejected; response body omitted to prevent sensitive-data leakage"
+                        .to_string(),
             });
         }
-        let response: BuildMintResponse = response.json().await.map_err(|err| {
-            BotError::Transaction(format!(
-                "OpenSea API returned invalid transaction data: {err}"
-            ))
+        let response: BuildMintResponse =
+            read_json_response(response, "OpenSea API returned invalid transaction data").await?;
+        let target = response.target.parse().map_err(|_| {
+            BotError::Transaction("OpenSea returned an invalid target address".to_string())
         })?;
-        let target = response
-            .target
-            .parse()
-            .map_err(|_| BotError::InvalidAddress {
-                value: response.target.clone(),
-            })?;
         let calldata = decode_hex(&response.calldata, "calldata")?;
         let value = parse_u256(&response.value)?;
         Ok(OpenSeaMintTransaction {
@@ -126,21 +123,18 @@ impl OpenSeaClient {
             .header("X-API-KEY", self.api_key.as_str())
             .send()
             .await
-            .map_err(|err| BotError::Transaction(format!("OpenSea API request failed: {err}")))?;
+            .map_err(|_| BotError::Transaction("OpenSea API request failed".to_string()))?;
         let status = response.status();
         if !status.is_success() {
-            let message = response
-                .text()
-                .await
-                .unwrap_or_else(|err| format!("could not read response body: {err}"));
             return Err(BotError::OpenSeaApi {
                 status: status.as_u16(),
-                message: truncate_message(&message),
+                message:
+                    "request rejected; response body omitted to prevent sensitive-data leakage"
+                        .to_string(),
             });
         }
-        let body: Value = response.json().await.map_err(|err| {
-            BotError::Transaction(format!("OpenSea returned invalid drop details: {err}"))
-        })?;
+        let body: Value =
+            read_json_response(response, "OpenSea returned invalid drop details").await?;
         let stages = body
             .get("stages")
             .or_else(|| body.get("drop").and_then(|drop| drop.get("stages")))
@@ -180,10 +174,10 @@ fn parse_stage(stage: &Value, index: usize) -> Result<OpenSeaStage> {
         .get("endTime")
         .or_else(|| stage.get("end_time"))
         .and_then(parse_timestamp);
-    let label = stage
-        .get("label")
-        .and_then(Value::as_str)
-        .map_or_else(|| format!("stage {}", index + 1), ToOwned::to_owned);
+    let label = stage.get("label").and_then(Value::as_str).map_or_else(
+        || format!("stage {}", index + 1),
+        |label| sanitize_external_text(label, 80),
+    );
     Ok(OpenSeaStage {
         label,
         start_time: start,
@@ -207,6 +201,11 @@ fn parse_timestamp(value: &Value) -> Option<u64> {
 
 fn decode_hex(value: &str, field: &str) -> Result<Vec<u8>> {
     let value = value.strip_prefix("0x").unwrap_or(value);
+    if value.len() > MAX_CALLDATA_BYTES.saturating_mul(2) {
+        return Err(BotError::Transaction(format!(
+            "OpenSea returned {field} larger than the safety limit"
+        )));
+    }
     hex::decode(value).map_err(|err| {
         BotError::Transaction(format!("OpenSea returned invalid {field} hex: {err}"))
     })
@@ -217,20 +216,40 @@ fn parse_u256(value: &str) -> Result<U256> {
     let (digits, radix) = value
         .strip_prefix("0x")
         .map_or((value, 10), |digits| (digits, 16));
-    U256::from_str_radix(digits, radix).map_err(|err| BotError::InvalidAmount {
-        value: value.to_string(),
-        reason: format!("OpenSea returned an invalid transaction value: {err}"),
-    })
+    U256::from_str_radix(digits, radix)
+        .map_err(|_| BotError::Transaction("OpenSea returned an invalid transaction value".into()))
 }
 
-fn truncate_message(message: &str) -> String {
-    const MAX_MESSAGE_LENGTH: usize = 512;
-    let mut message = message.trim().to_string();
-    if message.len() > MAX_MESSAGE_LENGTH {
-        message.truncate(MAX_MESSAGE_LENGTH);
-        message.push_str("...");
+async fn read_json_response<T: DeserializeOwned>(
+    mut response: Response,
+    context: &str,
+) -> Result<T> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES)
+    {
+        return Err(BotError::Transaction(format!(
+            "{context}: response exceeded the 1 MiB safety limit"
+        )));
     }
-    message
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| BotError::Transaction(format!("{context}: response body could not be read")))?
+    {
+        let next_length = body.len().checked_add(chunk.len()).ok_or_else(|| {
+            BotError::Transaction(format!("{context}: response length overflowed"))
+        })?;
+        if next_length as u64 > MAX_RESPONSE_BYTES {
+            return Err(BotError::Transaction(format!(
+                "{context}: response exceeded the 1 MiB safety limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body)
+        .map_err(|_| BotError::Transaction(format!("{context}: malformed JSON")))
 }
 
 #[cfg(test)]

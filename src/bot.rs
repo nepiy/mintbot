@@ -8,7 +8,7 @@ use crate::{
     setup::{bind_manual_control, cleanup_manual_control, prompt_interactive_config},
     state::{AtomicBotState, BotState},
     trigger::{TriggerEngine, TriggerObservation},
-    wallet::{LoadedWallet, short_address},
+    wallet::{LoadedWallet, WalletNonceLock, short_address},
 };
 use alloy::{
     consensus::BlockHeader,
@@ -153,7 +153,7 @@ pub async fn run_simulation(config_path: PathBuf) -> Result<()> {
     println!("--------------------------------");
     println!("Collection: {}", config.name);
     println!("Chain ID: {}", config.chain_id);
-    println!("Wallet: {}", wallet.address);
+    println!("Wallet: {}", short_address(wallet.address));
     println!("Contract: {}", config.contract_address);
     println!("Quantity: {}", config.quantity);
     println!("Mint value: {} wei", prepared.mint_value);
@@ -340,12 +340,7 @@ async fn hydrate_opensea_transaction(
             mint.target, expected_contract
         )));
     }
-    if config.require_zero_value && !mint.value.is_zero() {
-        return Err(BotError::Transaction(format!(
-            "OpenSea returned a nonzero mint value of {} wei; free-mint price guard refused to sign",
-            mint.value
-        )));
-    }
+    validate_opensea_mint_value(config, mint.value)?;
 
     let mut request = TransactionRequest::default()
         .with_from(wallet.address)
@@ -380,6 +375,24 @@ async fn hydrate_opensea_transaction(
     prepared.gas_limit = gas_limit;
     prepared.opensea_hydrated = true;
     refresh_transaction_fields(config, rpc, wallet, prepared).await?;
+    Ok(())
+}
+
+fn validate_opensea_mint_value(config: &MintConfig, value: U256) -> Result<()> {
+    if config.require_zero_value && !value.is_zero() {
+        return Err(BotError::Transaction(format!(
+            "OpenSea returned a nonzero mint value of {} wei; free-mint price guard refused to sign",
+            value
+        )));
+    }
+    if let Some(maximum) = config.maximum_opensea_mint_value_wei()?
+        && value > maximum
+    {
+        return Err(BotError::MintValueExceeded {
+            returned: value.to_string(),
+            maximum: maximum.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -991,8 +1004,9 @@ async fn execute_transaction(
     }
 
     metrics.finalization_started = Some(Instant::now());
+    let nonce_lock = WalletNonceLock::acquire(wallet.address).await?;
     let mut request = prepared.request.clone();
-    if matches!(config.nonce_strategy, NonceStrategy::JustBeforeTrigger) {
+    if !matches!(config.nonce_strategy, NonceStrategy::Preloaded) {
         request.set_nonce(rpc.preload_nonce(wallet.address).await?);
     }
     metrics.finalization_completed = Some(Instant::now());
@@ -1004,6 +1018,7 @@ async fn execute_transaction(
     state.store(BotState::Broadcasting);
     metrics.broadcast_started = Some(Instant::now());
     let (hash, rpc_elapsed) = rpc.broadcast_raw(raw).await?;
+    drop(nonce_lock);
     metrics.first_rpc_response = Some(Instant::now());
     state.store(BotState::Submitted);
     println!("\nTRIGGER DETECTED");
@@ -1253,13 +1268,22 @@ fn print_armed(
         println!("Mint value: fetched from OpenSea when the stage is active");
         if config.require_zero_value {
             println!("Price guard: REQUIRED FREE MINT (nonzero value will abort)");
+        } else if let Some(maximum_per_nft) = config.max_price_per_nft.as_deref()
+            && let Ok(Some(maximum_total)) = config.maximum_opensea_mint_value_wei()
+        {
+            println!(
+                "Price guard: <= {maximum_per_nft} per NFT ({maximum_total} wei total maximum)"
+            );
         }
     } else {
         println!("Mint value: {} wei", prepared.mint_value);
     }
     println!("Wallet: {}", short_address(wallet.address));
     println!("Gas limit: {}", prepared.gas_limit);
-    println!("Maximum fee cap: {} wei/gas", prepared.fee_cap);
+    println!("Current maximum fee: {} wei/gas", prepared.fee_cap);
+    if let Some(maximum) = config.gas.max_total_gas_cost_native.as_deref() {
+        println!("Maximum total gas cost: {maximum} native currency");
+    }
     println!(
         "Nonce: {}",
         prepared.request.nonce.map_or_else(
@@ -1322,5 +1346,44 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_opensea_mint_value;
+    use crate::config::MintConfig;
+    use alloy::primitives::U256;
+
+    fn opensea_config(require_zero_value: bool, maximum: Option<&str>) -> MintConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "Price guard test",
+            "chain_id": 4663,
+            "contract_address": "0x0000000000000000000000000000000000000001",
+            "opensea_drop_slug": "price-guard-test",
+            "require_zero_value": require_zero_value,
+            "max_price_per_nft": maximum,
+            "quantity": 2,
+            "mint": { "function": "mint(uint256)" },
+            "trigger": { "type": "block_timestamp", "timestamp": 0 }
+        }))
+        .expect("valid test config")
+    }
+
+    #[test]
+    fn paid_opensea_guard_accepts_lower_price_and_rejects_higher_price() {
+        let config = opensea_config(false, Some("0.001"));
+        assert!(validate_opensea_mint_value(&config, U256::from(1_000_000_000_000_000u64)).is_ok());
+        assert!(validate_opensea_mint_value(&config, U256::from(2_000_000_000_000_000u64)).is_ok());
+        assert!(
+            validate_opensea_mint_value(&config, U256::from(2_000_000_000_000_001u64)).is_err()
+        );
+    }
+
+    #[test]
+    fn free_opensea_guard_rejects_any_payment() {
+        let config = opensea_config(true, Some("0"));
+        assert!(validate_opensea_mint_value(&config, U256::ZERO).is_ok());
+        assert!(validate_opensea_mint_value(&config, U256::from(1)).is_err());
     }
 }

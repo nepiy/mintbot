@@ -76,6 +76,7 @@ fn validates_opensea_drop_slug() {
           "chain_id": 4663,
           "contract_address": "0x0000000000000000000000000000000000000001",
           "opensea_drop_slug": "robinhood-drop-2026",
+          "require_zero_value": true,
           "quantity": 1,
           "mint": { "function": "mint(uint256)" },
           "trigger": { "type": "block_timestamp", "timestamp": 0 }
@@ -85,4 +86,61 @@ fn validates_opensea_drop_slug() {
     assert!(config.validate().is_ok());
     config.opensea_drop_slug = Some("not/a-safe-slug".to_string());
     assert!(config.validate().is_err());
+}
+
+#[test]
+fn paid_opensea_mints_require_an_explicit_price_cap() {
+    let mut config: MintConfig = serde_json::from_str(
+        r#"{
+          "name": "Paid OpenSea drop",
+          "chain_id": 4663,
+          "contract_address": "0x0000000000000000000000000000000000000001",
+          "opensea_drop_slug": "paid-drop",
+          "quantity": 2,
+          "mint": { "function": "mint(uint256)" },
+          "trigger": { "type": "block_timestamp", "timestamp": 0 }
+        }"#,
+    )
+    .expect("valid JSON shape");
+    assert!(config.validate().is_err());
+    config.max_price_per_nft = Some("0.001".to_string());
+    assert!(config.validate().is_ok());
+    assert_eq!(
+        config
+            .maximum_opensea_mint_value_wei()
+            .expect("valid cap")
+            .expect("cap exists")
+            .to_string(),
+        "2000000000000000"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn saved_configs_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let source = directory.path().join("source.json");
+    fs::write(
+        &source,
+        r#"{
+          "name": "Private config",
+          "chain_id": 1,
+          "contract_address": "0x0000000000000000000000000000000000000001",
+          "quantity": 1,
+          "mint": { "function": "mint(uint256)" },
+          "trigger": { "type": "manual" }
+        }"#,
+    )
+    .expect("write source");
+    let config = MintConfig::load(&source).expect("load source");
+    let destination = directory.path().join("saved.json");
+    config.save_pretty(&destination).expect("save config");
+    let mode = fs::metadata(destination)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
 }

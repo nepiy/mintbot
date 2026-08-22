@@ -1,10 +1,15 @@
 use crate::error::{BotError, Result};
 use alloy::primitives::{Address, U256};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::Path,
+};
 
 pub const ROBINHOOD_MAINNET_CHAIN_ID: u64 = 4663;
 pub const ROBINHOOD_DEFAULT_GAS_LIMIT: u64 = 200_000;
+pub const ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE: &str = "0.001";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MintConfig {
@@ -17,6 +22,8 @@ pub struct MintConfig {
     pub opensea_drop_slug: Option<String>,
     #[serde(default)]
     pub require_zero_value: bool,
+    #[serde(default)]
+    pub max_price_per_nft: Option<String>,
     pub quantity: u64,
     pub mint: MintCallConfig,
     pub trigger: MintTrigger,
@@ -173,7 +180,21 @@ impl MintConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, serde_json::to_string_pretty(self)? + "\n")?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        }
+        file.write_all((serde_json::to_string_pretty(self)? + "\n").as_bytes())?;
+        file.sync_all()?;
         Ok(())
     }
 
@@ -192,6 +213,22 @@ impl MintConfig {
                 value: self.mint.price_per_nft.clone(),
                 reason: "quantity multiplication overflowed".to_string(),
             })
+    }
+
+    pub fn maximum_opensea_mint_value_wei(&self) -> Result<Option<U256>> {
+        self.max_price_per_nft
+            .as_deref()
+            .map(parse_native_amount)
+            .transpose()?
+            .map(|price| {
+                price.checked_mul(U256::from(self.quantity)).ok_or_else(|| {
+                    BotError::InvalidAmount {
+                        value: self.max_price_per_nft.clone().unwrap_or_default(),
+                        reason: "quantity multiplication overflowed".to_string(),
+                    }
+                })
+            })
+            .transpose()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -224,6 +261,19 @@ impl MintConfig {
             if self.quantity > 100 {
                 return Err(BotError::Config(
                     "OpenSea mint quantity must be between 1 and 100".to_string(),
+                ));
+            }
+            let maximum = self.maximum_opensea_mint_value_wei()?;
+            if self.require_zero_value {
+                if maximum.is_some_and(|value| !value.is_zero()) {
+                    return Err(BotError::Config(
+                        "max_price_per_nft must be zero or omitted when require_zero_value is enabled"
+                            .to_string(),
+                    ));
+                }
+            } else if maximum.is_none() {
+                return Err(BotError::Config(
+                    "max_price_per_nft is required for a paid OpenSea mint".to_string(),
                 ));
             }
         }

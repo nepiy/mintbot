@@ -1,7 +1,8 @@
 use crate::{
     config::{
         GasConfig, MintCallConfig, MintConfig, MintTrigger, NonceStrategy,
-        ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_MAINNET_CHAIN_ID,
+        ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
+        ROBINHOOD_MAINNET_CHAIN_ID,
     },
     error::{BotError, Result},
 };
@@ -96,6 +97,14 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
             "Require free mint (stop if OpenSea returns any payment)",
             true,
         )?;
+        let max_price_per_nft = if require_zero_value {
+            Some("0".to_string())
+        } else {
+            Some(ask(
+                "Maximum price per NFT (bot aborts if OpenSea returns more)",
+                "0.001",
+            )?)
+        };
         let stage_start = ask(
             "Earliest OpenSea stage time (Unix seconds; 0 to auto-use active/upcoming stages)",
             "0",
@@ -109,6 +118,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
             contract_address,
             opensea_drop_slug: Some(opensea_drop_slug),
             require_zero_value,
+            max_price_per_nft,
             quantity,
             mint: MintCallConfig {
                 function: "mint(uint256)".to_string(),
@@ -122,6 +132,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
             },
             gas: GasConfig {
                 gas_limit: Some(ROBINHOOD_DEFAULT_GAS_LIMIT),
+                max_total_gas_cost_native: Some(ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE.to_string()),
                 ..GasConfig::default()
             },
             nonce_strategy: NonceStrategy::JustBeforeTrigger,
@@ -228,6 +239,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         contract_address,
         opensea_drop_slug: None,
         require_zero_value: false,
+        max_price_per_nft: None,
         quantity,
         mint: MintCallConfig {
             function,
@@ -238,6 +250,8 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         trigger,
         gas: GasConfig {
             gas_limit: Some(gas_limit),
+            max_total_gas_cost_native: (!allow_manual)
+                .then(|| ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE.to_string()),
             ..GasConfig::default()
         },
         nonce_strategy: if allow_manual {

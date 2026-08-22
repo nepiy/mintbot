@@ -6,6 +6,7 @@ pub mod error;
 pub mod metrics;
 pub mod opensea;
 pub mod rpc;
+pub mod security;
 pub mod setup;
 pub mod state;
 pub mod trigger;

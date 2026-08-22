@@ -5,11 +5,14 @@ use nft_mint_bot::{
     error::Result,
     rpc::RpcClients,
     run_bot, run_interactive, run_simulation,
+    security::verify_dotenv_permissions,
     setup::{run_wizard, send_manual_trigger},
 };
+use std::path::Path;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    verify_dotenv_permissions(Path::new(".env"))?;
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
