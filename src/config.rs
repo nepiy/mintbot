@@ -8,6 +8,7 @@ use std::{
 };
 
 pub const ROBINHOOD_MAINNET_CHAIN_ID: u64 = 4663;
+pub const INK_MAINNET_CHAIN_ID: u64 = 57073;
 pub const ROBINHOOD_DEFAULT_GAS_LIMIT: u64 = 200_000;
 pub const ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE: &str = "0.001";
 

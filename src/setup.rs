@@ -1,6 +1,6 @@
 use crate::{
     config::{
-        GasConfig, MintCallConfig, MintConfig, MintTrigger, NonceStrategy,
+        GasConfig, INK_MAINNET_CHAIN_ID, MintCallConfig, MintConfig, MintTrigger, NonceStrategy,
         ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
         ROBINHOOD_MAINNET_CHAIN_ID,
     },
@@ -50,16 +50,28 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     } else {
         "Robinhood NFT".to_string()
     };
-    let chain_id = if allow_manual {
-        ask("Chain ID", "1")?
+    let (chain_id, network_name) = if allow_manual {
+        let chain_id = ask("Chain ID", "1")?
             .parse()
-            .map_err(|err| BotError::Config(format!("invalid chain ID: {err}")))?
+            .map_err(|err| BotError::Config(format!("invalid chain ID: {err}")))?;
+        (chain_id, None)
     } else {
-        println!("Network: Robinhood Chain mainnet (chain ID {ROBINHOOD_MAINNET_CHAIN_ID})");
-        ROBINHOOD_MAINNET_CHAIN_ID
+        println!("Select network:\n1. Robinhood Chain mainnet\n2. Ink mainnet");
+        match ask("Network", "1")?.trim() {
+            "1" => (ROBINHOOD_MAINNET_CHAIN_ID, Some("Robinhood Chain mainnet")),
+            "2" => (INK_MAINNET_CHAIN_ID, Some("Ink mainnet")),
+            _ => {
+                return Err(BotError::Config(
+                    "network must be 1 (Robinhood) or 2 (Ink)".to_string(),
+                ));
+            }
+        }
     };
+    if let Some(network_name) = network_name {
+        println!("Network: {network_name} (chain ID {chain_id})");
+    }
     let contract_address = ask(
-        "Contract address",
+        "Collection contract address",
         "0x0000000000000000000000000000000000000000",
     )?;
     let opensea_drop_slug = if allow_manual {
