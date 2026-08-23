@@ -1,40 +1,52 @@
 # NFT Mint Bot
 
-`nft-mint-bot` is a terminal-based, event-driven NFT mint executor for EVM-compatible networks. It prepares a legitimate wallet transaction before a sale opens, enters an explicit `BOT ARMED` state, listens for new blocks or configured contract events over WebSocket, atomically accepts the first valid trigger, signs locally, broadcasts the exact same raw transaction to all configured HTTP endpoints, and monitors the receipt.
+## 1. Information about the bot
 
-It does not automate a browser, click a website, use MetaMask, or bypass allowlists, signatures, queues, CAPTCHA, wallet limits, or other contract/platform controls. Any proof or authorization must be supplied by the user in the collection configuration.
+`nft-mint-bot` is a terminal-based, event-driven NFT mint executor for EVM-compatible networks. It prepares a wallet transaction before a sale opens, waits for a blockchain trigger, signs locally, broadcasts the same raw transaction to configured HTTP RPC endpoints, and monitors the receipt.
 
-For OpenSea Drops, the optional Drops API mode asks OpenSea to build the eligible mint transaction for the connected wallet. OpenSea applies the active GTD/FCFS/public stage rules and returns the exact contract, calldata, and payment value for the wallet to sign; it does not bypass eligibility.
+The interactive launcher supports:
 
-## Supported networks
+- Robinhood Chain mainnet — chain ID `4663`
+- Ink mainnet — chain ID `57073`
 
-The implementation is network-agnostic: Ethereum, Base, Arbitrum, Optimism, Polygon, BNB Chain, Avalanche C-Chain, Robinhood Chain, local Anvil, and other EVM JSON-RPC networks can be used by changing the chain ID and endpoints. No network-specific transaction logic is hardcoded. Solana is intentionally not mixed into this engine; a future Solana backend should implement a separate chain abstraction.
+Advanced JSON configurations can target other EVM-compatible networks by providing the correct chain ID, RPC endpoints, contract address, mint ABI, and trigger.
 
-## How it works
+For OpenSea Drops, the optional Drops API mode asks OpenSea to build the eligible mint transaction for the configured wallet. OpenSea selects the active GTD, FCFS, or public stage and returns the calldata and exact payment value. The bot does not bypass allowlists, signatures, queues, CAPTCHA, wallet limits, or other contract/platform controls.
 
-Startup performs configuration validation, signer creation, HTTP and WebSocket connection setup, chain and bytecode validation, dynamic ABI parsing, calldata encoding, value calculation, nonce loading, gas estimation/selection, gas-cap validation, balance validation, transaction-template preparation, and trigger subscription setup. Only after all critical checks and subscriptions succeed does it print `BOT ARMED`.
+In OpenSea mode, the contract you enter is the NFT collection contract. The bot automatically uses OpenSea’s SeaDrop transaction target internally; you do not need to inspect a wallet popup to find that address.
 
-The trigger monitor is block-driven rather than a timer poller:
+## 2. Qualities
 
-```text
-WebSocket block/log
-        ↓
-trigger evaluation
-        ↓
-atomic WaitingForTrigger → Triggered transition
-        ↓
-local signing
-        ↓
-same raw transaction to configured HTTP RPCs
-        ↓
-receipt and optional replacement monitor
-```
+### Safety
 
-The atomic state transition means a block trigger, event trigger, or manual trigger racing with another trigger can produce at most one submission attempt.
+- Validates the configured chain ID, RPC providers, and deployed contract bytecode before arming.
+- Requires encrypted `https://` and `wss://` RPC transport outside local development.
+- Keeps the private key in memory, loads it only from `.env`, and prints only a shortened wallet address.
+- Uses a dedicated wallet recommendation and owner-only permissions for `.env` and generated configuration files.
+- Uses a one-shot atomic trigger transition, so competing block, event, or manual triggers produce at most one submission attempt.
+- Uses the latest live OpenSea price/value and refuses to sign above the configured cap.
+- Free-mint mode refuses any nonzero payment.
+- Applies a maximum total gas-cost cap before arming and before submission.
+- Serializes just-in-time nonce selection across local bot processes.
 
-## Installation
+### Low-latency execution
 
-Rust stable is required. The current Alloy release selected by `Cargo.toml` requires Rust 1.94.1 or newer.
+- Monitors every new block through WebSocket instead of polling a timer.
+- Prepares configuration, ABI, calldata, gas strategy, balance checks, and subscriptions before `BOT ARMED`.
+- Refreshes dynamic fee fields while waiting.
+- Broadcasts identical signed bytes to every healthy configured HTTP endpoint.
+- Reconnects WebSocket subscriptions and backfills missed event logs after a transport interruption.
+- Supports bounded transaction replacement with the same nonce when explicitly enabled.
+
+### Honest execution model
+
+The bot does not automate a browser, click OpenSea, use MetaMask, acquire Merkle proofs, forge signatures, or defeat eligibility checks. Any proof or authorization must be legitimately supplied by the user or returned for the connected wallet by OpenSea’s API.
+
+## 3. Setup mechanics
+
+### Prerequisites
+
+Rust stable is required. The current Alloy release selected by `Cargo.toml` requires Rust `1.94.1` or newer.
 
 ```bash
 cp .env.example .env
@@ -42,11 +54,11 @@ chmod 600 .env
 cargo build --release
 ```
 
-The release profile uses optimized codegen, thin LTO, one codegen unit, `panic = "abort"`, and symbol stripping. Measure the release binary, not `cargo run` debug builds.
+Use the release binary for real runs. `cargo run --release` rebuilds only when needed and then starts it.
 
-## Environment
+### Environment
 
-Copy `.env.example` to `.env` and fill in:
+Fill `.env` with a dedicated mint wallet and RPC endpoints:
 
 ```dotenv
 PRIVATE_KEY=0x...
@@ -60,13 +72,44 @@ BROADCAST_TIMEOUT_MS=3000
 RUST_LOG=nft_mint_bot=info
 ```
 
-`BACKUP_RPC_URL` and `BROADCAST_RPC_URLS` are optional. Mainnet RPCs must use encrypted `https://` and `wss://` transport; plain `http://` and `ws://` are accepted only for loopback development nodes. At startup, the bot verifies the WebSocket endpoint and every usable HTTP endpoint against `chain_id`; wrong-chain endpoints prevent arming and unavailable endpoints are excluded. Healthy HTTP endpoints provide read fallback as well as receiving the identical signed bytes. The first valid acknowledgement is treated as submission, and the returned hash must match the locally computed transaction hash. Known-transaction responses are accepted as successful rebroadcasts. The timeout values are optional and must be positive integer milliseconds.
+The generic RPC variables are used by default, including for Robinhood. Ink can use its own profile:
 
-Use a dedicated mint wallet. Fund it with the mint value, maximum expected gas, and a small margin only. Never use a valuable main wallet for automation, never commit `.env`, and never paste a private key into JSON. The process holds the signer in memory and only prints a shortened address.
+```dotenv
+INK_HTTP_RPC_URL=https://rpc-gel.inkonchain.com
+INK_WS_RPC_URL=wss://ws-gel.inkonchain.com
+INK_BACKUP_RPC_URL=
+INK_BROADCAST_RPC_URLS=
+```
 
-## Collection configuration
+The interactive launcher selects the Ink profile automatically when those variables are present. Ink’s official mainnet RPC documentation lists the HTTPS and WebSocket endpoints above. [Ink RPC documentation](https://docs.inkonchain.com/tools/rpc)
 
-Start with [`configs/example.json`](configs/example.json), replace the placeholder contract address, and adjust the chain and RPC endpoints. One configuration file represents one mint. Personal mint configurations are ignored by Git by default; only the placeholder example is tracked.
+Keep backup and broadcast endpoints on the same network as the selected primary endpoints. Public RPCs may be rate-limited; use a dedicated provider for a time-sensitive mint. At startup, the bot verifies every usable endpoint against the configured chain ID and refuses to arm on a wrong-chain provider.
+
+Never commit `.env`, paste a private key into JSON, or use a valuable main wallet for automation. The process needs enough native currency for the mint value, maximum expected gas, and a small margin.
+
+### Interactive configuration
+
+The interactive launcher does not ask for a raw chain ID. It asks for a network choice, then selects the correct chain ID automatically:
+
+```text
+1. Robinhood Chain mainnet
+2. Ink mainnet
+```
+
+For a direct contract mint, it asks for the collection contract, quantity, price, proof if required, and an automatic trigger. The normal default is `mint(uint256)` with `$quantity`; collections with another ABI should use the advanced JSON workflow.
+
+For an OpenSea GTD/FCFS/public drop, set `OPENSEA_API_KEY` and enter the collection’s drop slug. Enter `direct` only for a custom contract mint. OpenSea mode then asks:
+
+- Whether the mint must remain free.
+- If paid, the maximum acceptable price per NFT.
+- The earliest stage time; enter `0` to automatically monitor active/upcoming stages.
+- The mint quantity.
+
+When the stage opens, the bot asks OpenSea to build a transaction for the configured wallet and quantity. If the wallet is not eligible for the current stage, the monitor can advance to the next scheduled stage. A higher returned price aborts before signing, and free-mint mode aborts on any nonzero value.
+
+### Advanced JSON configuration
+
+Start with [`configs/example.json`](configs/example.json). One configuration file represents one mint. Personal mint configurations are ignored by Git by default; only the placeholder example is tracked.
 
 ```json
 {
@@ -103,42 +146,16 @@ Start with [`configs/example.json`](configs/example.json), replace the placehold
 }
 ```
 
-Supported argument placeholders are `$wallet`, `$quantity`, and `$proof`. Common dynamic calls include `mint(uint256)`, `publicMint(uint256)`, `mint(address,uint256)`, and `mint(uint256,bytes32[])`. The proof is encoded only when it is legitimately provided. Static bindings for the included `MockMint` interface are demonstrated in `src/abi.rs`; the normal collection path uses dynamic ABI parsing so a new mint does not require recompilation.
+Supported argument placeholders are `$wallet`, `$quantity`, and `$proof`. Common dynamic calls include `mint(uint256)`, `publicMint(uint256)`, `mint(address,uint256)`, and `mint(uint256,bytes32[])`.
 
-`expected_start_time` is informational. It never overrides actual on-chain state and the bot does not exit when that time passes.
+## 4. Run mechanics
 
-### Trigger types
+### Interactive run
 
-- `block_timestamp`: fire when an incoming block header timestamp reaches the configured Unix timestamp.
-- `boolean_contract_state`: call a zero-argument view such as `publicSaleActive() returns (bool)` once per incoming block.
-- `numeric_phase`: call a zero-argument view and compare the returned unsigned integer to `target_value`.
-- `contract_event`: subscribe to a contract event such as `PublicSaleStarted()` and optionally wait for event confirmations.
-- `manual`: wait for the local control command described below.
-
-The timestamp trigger uses the chain header, not the local clock. View triggers read the configured contract at the exact incoming block hash through the healthy HTTP provider set. Event subscriptions are restricted to the configured contract address and event signature; confirmed events are rechecked for canonicality, and reconnects backfill the missed block range.
-
-### Gas and nonce safety
-
-Gas modes are `auto`, `eip1559`, `legacy`, and `manual`. Auto mode estimates EIP-1559 fees, applies `gas.multiplier`, and refreshes fees while the bot waits; explicit modes accept gwei strings without floating-point money arithmetic. `max_total_gas_cost_native` prevents arming or submitting when the estimated maximum gas cost exceeds the configured cap. Robinhood interactive mode defaults this cap to `0.001` native currency. If a closed sale causes `eth_estimateGas` to revert before opening, set `gas.gas_limit` from a trusted simulation or prior transaction; the bot will not guess a limit.
-
-Nonce modes are:
-
-- `preloaded`: lowest trigger latency; obtains the pending nonce before arming. Do not send another transaction from this wallet while armed.
-- `refresh_each_block`: refreshes the pending nonce on each received block.
-- `just_before_trigger`: fetches the pending nonce after the trigger wins and before signing.
-
-Replacement transactions, when enabled, reuse the original nonce, bump the applicable fee fields, stop after `max_attempts`, and respect the gas cap. Receipt monitoring continues across the original hash and every replacement hash.
-
-When multiple bot processes use the same wallet, just-in-time nonce selection is serialized with an owner-only local file lock through signing and initial broadcast. This prevents two simultaneous triggers from selecting the same pending nonce. `preloaded` mode remains an expert low-latency option and still requires exclusive wallet use while armed.
-
-## Commands
-
-### Interactive launch
-
-For a one-off mint, you do not need to prepare a JSON file first. Start the interactive flow:
+Start the optimized launcher:
 
 ```bash
-./target/release/nft-mint-bot
+cargo run --release
 ```
 
 The explicit equivalent is:
@@ -147,59 +164,67 @@ The explicit equivalent is:
 ./target/release/nft-mint-bot start
 ```
 
-It targets Robinhood Chain mainnet automatically (chain ID `4663`), so it does not ask for a chain ID, collection name, mint function, arguments, or gas limit. The normal contract flow asks for the contract address, quantity, price, proof, and an automatic trigger. Its defaults are `mint(uint256)` with `$quantity` and a `200000` gas limit; collections using a different signature or requiring a higher limit must use the JSON/advanced workflow.
+After setup succeeds, the bot prints `BOT ARMED`, waits for the selected trigger, signs locally, broadcasts, and monitors the receipt. `Mint value: fetched from OpenSea when the stage is active` is normal before an OpenSea stage opens.
 
-To use an OpenSea GTD/FCFS/public drop, set `OPENSEA_API_KEY` in `.env` and enter the collection’s OpenSea drop slug when prompted. When that key is configured, the interactive flow requires a slug or the explicit word `direct`; it will not silently fall back to the incompatible direct-contract flow. OpenSea mode asks whether the mint must remain free; when enabled, any nonzero value returned by OpenSea aborts before signing. For a paid mint, it asks for the maximum acceptable price per NFT. A lower live price is accepted, while a higher price aborts before signing. The bot fetches the drop’s stage schedule, so enter `0` to monitor the active and upcoming stages automatically, or enter a Unix timestamp to ignore stages before that time. It can be started before the first stage and remains armed; when a stage starts it calls `POST /api/v2/drops/{slug}/mint` with your wallet and quantity. OpenSea then chooses the first active stage for which that wallet is eligible and returns the ready-to-sign transaction. If you are not GTD-eligible, a 422 response advances the monitor to the next scheduled stage, such as FCFS, without requiring a Merkle proof. OpenSea supplies the calldata and exact payable value; the local price guard decides whether that value may be signed.
-
-The interactive configuration is held in memory and is not written to a JSON file. Use `--dry-run` to verify the trigger path without signing or broadcasting:
+Use dry-run to verify the trigger path without signing or broadcasting:
 
 ```bash
 ./target/release/nft-mint-bot start --dry-run
 ```
 
-Interactive setup keeps the private key out of the generated JSON:
+### Advanced commands
 
 ```bash
+# Save a JSON configuration interactively
 ./target/release/nft-mint-bot setup
-```
 
-Benchmark the configured RPCs, including chain ID, block number, balance, WebSocket startup, and subscription setup:
-
-```bash
-./target/release/nft-mint-bot rpc-test
-```
-
-Validate and simulate without broadcasting:
-
-```bash
+# Validate and simulate without broadcasting
 ./target/release/nft-mint-bot simulate --config configs/my-mint.json
-```
 
-Run against actual chain triggers but stop immediately before signing:
-
-```bash
+# Run actual triggers but stop before signing
 ./target/release/nft-mint-bot run --config configs/my-mint.json --dry-run
-```
 
-Run the real executor:
-
-```bash
+# Run the real JSON-configured executor
 ./target/release/nft-mint-bot run --config configs/my-mint.json
+
+# Measure configured RPC endpoints and WebSocket setup
+./target/release/nft-mint-bot rpc-test
+
+# Measure local preparation and signing without sending a transaction
+./target/release/nft-mint-bot benchmark --iterations 10000
 ```
 
-For a manual trigger, start the bot with a `manual` trigger and run this from another terminal:
+For a `manual` trigger, run the bot and then send the authenticated local trigger from another terminal:
 
 ```bash
 ./target/release/nft-mint-bot trigger --config configs/my-mint.json
 ```
 
-The control channel binds only to localhost and writes a mode-`0600` short-lived control file under the system temporary directory. The command authenticates with a random one-time token from that file, the listener accepts exactly one valid trigger, and the file is removed when the monitor exits.
+### Trigger types
 
-OpenSea API mode still requires the contract address: the bot compares OpenSea’s returned transaction target with that address before signing. The API key is read from `OPENSEA_API_KEY`, is never logged or stored in the mint configuration, and is held only in memory.
+- `block_timestamp`: fire when an incoming block timestamp reaches a Unix timestamp.
+- `boolean_contract_state`: call a zero-argument view such as `publicSaleActive() returns (bool)` once per block.
+- `numeric_phase`: call a zero-argument view and compare the returned integer to `target_value`.
+- `contract_event`: subscribe to an event such as `PublicSaleStarted()` and optionally wait for confirmations.
+- `manual`: wait for the authenticated local control command.
 
-## Local Anvil test
+The timestamp trigger uses the chain header, not the computer’s local clock. View triggers read the configured contract at the exact incoming block hash. Event subscriptions are restricted to the configured contract and event signature; canonicality is rechecked after confirmations.
 
-[`contracts/MockNFT.sol`](contracts/MockNFT.sol) is a deliberately small test contract. It has `publicSaleActive()`, `salePhase()`, a `PublicSaleStarted` event, and a `mint(uint256)` function.
+### Gas and nonce behavior
+
+Gas modes are `auto`, `eip1559`, `legacy`, and `manual`. Auto mode estimates EIP-1559 fees, applies the configured multiplier, and refreshes fee fields while waiting. `max_total_gas_cost_native` is only a safety ceiling; the actual fee is gas used multiplied by the effective gas price.
+
+Nonce modes are:
+
+- `preloaded`: lowest trigger latency, but do not send another transaction from that wallet while armed.
+- `refresh_each_block`: refreshes the pending nonce on each block.
+- `just_before_trigger`: obtains the pending nonce after the trigger wins and immediately before signing.
+
+Ctrl+C stops an armed monitor without submitting. After a transaction has been submitted, Ctrl+C stops receipt monitoring but cannot cancel the blockchain transaction; keep the printed hash for independent tracking.
+
+### Local Anvil test
+
+[`contracts/MockNFT.sol`](contracts/MockNFT.sol) is a small test contract with sale-state views, a sale event, and `mint(uint256)`.
 
 With Foundry installed:
 
@@ -210,7 +235,7 @@ forge create contracts/MockNFT.sol:MockNFT \
   --private-key <anvil-test-private-key>
 ```
 
-Copy the deployed address into `configs/example.json`, use the Anvil funded key as `PRIVATE_KEY`, and set `WS_RPC_URL=ws://127.0.0.1:8545` and `HTTP_RPC_URL=http://127.0.0.1:8545`. Start the bot with the boolean trigger, confirm `BOT ARMED`, then activate the sale in another terminal:
+Use the deployed address in `configs/example.json`, the Anvil funded key as `PRIVATE_KEY`, and loopback RPC URLs. Activate the sale from another terminal:
 
 ```bash
 cast send <contract-address> "setPublicSale(bool)" true \
@@ -218,41 +243,23 @@ cast send <contract-address> "setPublicSale(bool)" true \
   --private-key <anvil-test-private-key>
 ```
 
-The next relevant block makes the boolean trigger ready. The Rust tests cover configuration defaults, unit parsing, ABI/proof encoding, event-filter construction, and the block/event one-shot race. The Anvil flow above is the live integration smoke test because it requires an external node and deployed address.
+### Troubleshooting
 
-## RPC and latency tuning
+- `PRIVATE_KEY is not set`: run the command from the directory containing `.env` or export the variable.
+- `chain ID mismatch`: select the correct network and ensure every RPC profile endpoint belongs to it.
+- `has no deployed bytecode`: check the contract address and selected network.
+- `insufficient balance`: fund the dedicated wallet for mint value plus the configured gas ceiling.
+- ABI errors: use canonical Solidity signatures and match argument types/counts.
+- OpenSea stage unavailable: the stage may not yet be active or the wallet may not be eligible; the monitor may advance to the next scheduled stage.
+- WebSocket disconnects: the monitor reconnects, revalidates the chain, restores subscriptions, and backfills missed event logs.
+- Reverted transaction: inspect the receipt and contract requirements; the bot does not bypass sale state, allowlists, signatures, or wallet limits.
 
-Run `rpc-test` several times and compare the reported distribution of real provider response times. In practice, endpoint location, provider load, WebSocket reliability, and transaction propagation usually dominate local Rust execution time. The bot records `Instant` timestamps for trigger receipt/evaluation, atomic acquisition, signing, and the first broadcast acknowledgement, then prints a latency report after submission.
+### Official references
 
-`benchmark` measures local calldata preparation, transaction finalization, signing, raw encoding, the atomic operation, and the combined trigger-to-send-ready path without sending a transaction:
-
-```bash
-./target/release/nft-mint-bot benchmark --iterations 10000
-```
-
-Keep critical-path logging intentionally small. Calldata, ABI parsing, environment reads, RPC client setup, balance checks, gas estimation, and signer construction happen before `ARMED` wherever possible.
-
-## Troubleshooting
-
-- `PRIVATE_KEY is not set`: load `.env` from the directory where the command runs or export the variable.
-- `chain ID mismatch`: update `chain_id`; the bot refuses to arm against a different chain.
-- `has no deployed bytecode`: check the address and network; the bot refuses to arm for an empty address.
-- `insufficient balance`: fund the dedicated wallet for mint value plus the configured maximum gas cost.
-- ABI errors: use canonical Solidity signatures and make `arguments` count/types match the function. Use placeholders only where supported.
-- WebSocket disconnects: the monitor logs the failure, reconnects with bounded Alloy retries, revalidates the chain ID, restores subscriptions, and backfills event logs across the gap. HTTP broadcast/read endpoints remain available independently.
-- A pending transaction: enable bounded replacement only after choosing an appropriate fee multiplier and safety cap. Never run an unbounded replacement loop.
-- A reverted transaction: inspect the receipt and contract requirements. This tool does not bypass sale state, allowlists, signatures, or wallet limits.
-
-Ctrl+C stops an armed monitor without submitting. After a transaction is submitted, Ctrl+C stops receipt monitoring but prints the transaction hash so it can be followed independently.
-
-## Adding another collection or EVM chain
-
-Create another JSON file, change `chain_id`, endpoints, contract address, mint signature/arguments, price, and trigger. No Rust source change is needed for normal dynamic mint calls. A known contract can instead add a compile-time `alloy::sol!` interface for stronger type checking and IDE support; dynamic JSON ABI is more flexible but moves ABI validation to startup. A new EVM chain only needs compatible HTTP/WebSocket JSON-RPC endpoints and the correct chain ID/native denomination.
-
-## Limitations and future work
-
-This version intentionally does not include a mempool watcher, private relay submission, contract-specific source-code inference, automated proof acquisition, or Solana transaction logic. Public mempool support is highly provider- and L2-dependent and should be added as an optional signal without replacing block/event monitoring. Future Solana support should be a separate engine with its own transaction preparation, signing, and RPC abstractions.
-
-## Official API references
-
-The OpenSea integration follows [Build mint transaction data](https://docs.opensea.io/reference/build_drop_mint_transaction) and [Mint from a Drop Programmatically](https://docs.opensea.io/docs/mint-from-a-drop). The provider and transaction paths follow the current Alloy provider, ABI, and transaction APIs: [Alloy RPC providers](https://alloy.rs/rpc-providers/introduction/), [Alloy static and dynamic ABI](https://alloy.rs/guides/static-dynamic-abi-in-alloy/), and [Alloy transactions](https://alloy.rs/transactions/introduction/). Tokio’s signal handling is documented at [tokio::signal::ctrl_c](https://docs.rs/tokio/latest/tokio/signal/fn.ctrl_c.html).
+- [OpenSea: Mint from a Drop Programmatically](https://docs.opensea.io/docs/mint-from-a-drop)
+- [OpenSea: Build drop mint transaction](https://docs.opensea.io/reference/build_drop_mint_transaction)
+- [OpenSea: Compatible blockchains](https://support.opensea.io/en/articles/8867082-which-blockchains-are-compatible-with-opensea)
+- [Ink RPC documentation](https://docs.inkonchain.com/tools/rpc)
+- [Alloy RPC providers](https://alloy.rs/rpc-providers/introduction/)
+- [Alloy static and dynamic ABI](https://alloy.rs/guides/static-dynamic-abi-in-alloy/)
+- [Tokio Ctrl+C handling](https://docs.rs/tokio/latest/tokio/signal/fn.ctrl_c.html)

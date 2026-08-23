@@ -3,7 +3,7 @@ use crate::{
     config::{GasMode, MintConfig, MintTrigger, NonceStrategy, parse_gwei, parse_native_amount},
     error::{BotError, Result},
     metrics::LatencyMetrics,
-    opensea::{OpenSeaClient, OpenSeaStage},
+    opensea::{OPENSEA_SEADROP_ADDRESS, OpenSeaClient, OpenSeaStage},
     rpc::{RpcClients, simulate_call},
     setup::{bind_manual_control, cleanup_manual_control, prompt_interactive_config},
     state::{AtomicBotState, BotState},
@@ -60,7 +60,7 @@ async fn run_bot_with_config(
     println!("Contract: {}", config.contract_address);
 
     state.store(BotState::ConnectingRpc);
-    let mut rpc = RpcClients::connect_from_env().await?;
+    let mut rpc = RpcClients::connect_from_env_for_chain(config.chain_id).await?;
     println!("\nWS RPC: CONNECTED");
     println!("HTTP RPC: CONNECTED");
     println!(
@@ -142,7 +142,7 @@ async fn run_bot_with_config(
 pub async fn run_simulation(config_path: PathBuf) -> Result<()> {
     let config = MintConfig::load(&config_path)?;
     let wallet = LoadedWallet::from_env()?;
-    let mut rpc = RpcClients::connect_from_env().await?;
+    let mut rpc = RpcClients::connect_from_env_for_chain(config.chain_id).await?;
     rpc.validate_chain(&config).await?;
     rpc.validate_contract(&config).await?;
     let mut prepared = prepare_transaction(&config, &rpc, &wallet).await?;
@@ -334,7 +334,14 @@ async fn hydrate_opensea_transaction(
         .build_mint(drop_slug, wallet.address, config.quantity)
         .await?;
     let expected_contract = config.contract()?;
-    if mint.target != expected_contract {
+    if config.opensea_drop_slug.is_some() {
+        if mint.target != OPENSEA_SEADROP_ADDRESS {
+            return Err(BotError::Transaction(format!(
+                "OpenSea returned unsupported transaction target {}; expected the canonical SeaDrop contract {}",
+                mint.target, OPENSEA_SEADROP_ADDRESS
+            )));
+        }
+    } else if mint.target != expected_contract {
         return Err(BotError::Transaction(format!(
             "OpenSea returned target contract {}, but configuration specifies {}",
             mint.target, expected_contract

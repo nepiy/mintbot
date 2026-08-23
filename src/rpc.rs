@@ -42,25 +42,63 @@ impl std::fmt::Debug for RpcClients {
 
 impl RpcClients {
     pub async fn connect_from_env() -> Result<Self> {
-        let http_url = required_env("HTTP_RPC_URL")?;
-        let ws_url = required_env("WS_RPC_URL")?;
+        Self::connect_from_env_with_profile("").await
+    }
+
+    pub async fn connect_from_env_for_chain(chain_id: u64) -> Result<Self> {
+        let profile = match chain_id {
+            crate::config::ROBINHOOD_MAINNET_CHAIN_ID => "ROBINHOOD_",
+            crate::config::INK_MAINNET_CHAIN_ID => "INK_",
+            _ => "",
+        };
+        Self::connect_from_env_with_profile(profile).await
+    }
+
+    async fn connect_from_env_with_profile(profile: &str) -> Result<Self> {
+        let profile_http_name = format!("{profile}HTTP_RPC_URL");
+        let profile_ws_name = format!("{profile}WS_RPC_URL");
+        let use_profile = !profile.is_empty()
+            && (optional_env(&profile_http_name).is_some()
+                || optional_env(&profile_ws_name).is_some());
+        let http_name = if use_profile {
+            profile_http_name
+        } else {
+            "HTTP_RPC_URL".to_string()
+        };
+        let ws_name = if use_profile {
+            profile_ws_name
+        } else {
+            "WS_RPC_URL".to_string()
+        };
+        let backup_name = if use_profile {
+            format!("{profile}BACKUP_RPC_URL")
+        } else {
+            "BACKUP_RPC_URL".to_string()
+        };
+        let broadcast_name = if use_profile {
+            format!("{profile}BROADCAST_RPC_URLS")
+        } else {
+            "BROADCAST_RPC_URLS".to_string()
+        };
+        let http_url = required_env(&http_name)?;
+        let ws_url = required_env(&ws_name)?;
         let request_timeout = duration_from_env("RPC_TIMEOUT_MS", 5_000)?;
         let broadcast_timeout = duration_from_env("BROADCAST_TIMEOUT_MS", 3_000)?;
-        let http = connect_http("HTTP_RPC_URL", &http_url).await?;
+        let http = connect_http(&http_name, &http_url).await?;
         let ws_started = Instant::now();
-        let ws = tokio::time::timeout(request_timeout, connect_ws(&ws_url))
+        let ws = tokio::time::timeout(request_timeout, connect_ws(&ws_name, &ws_url))
             .await
             .map_err(|_| BotError::Rpc("WebSocket connection timed out".to_string()))??;
         let ws_connect_latency = ws_started.elapsed();
 
         let mut broadcast = vec![("primary".to_string(), http.clone())];
-        if let Some(backup) = optional_env("BACKUP_RPC_URL") {
+        if let Some(backup) = optional_env(&backup_name) {
             broadcast.push((
                 "backup".to_string(),
-                connect_http("BACKUP_RPC_URL", &backup).await?,
+                connect_http(&backup_name, &backup).await?,
             ));
         }
-        if let Some(extra) = optional_env("BROADCAST_RPC_URLS") {
+        if let Some(extra) = optional_env(&broadcast_name) {
             for (index, url) in extra
                 .split(',')
                 .map(str::trim)
@@ -69,7 +107,7 @@ impl RpcClients {
             {
                 broadcast.push((
                     format!("broadcast-{index}"),
-                    connect_http("BROADCAST_RPC_URLS", url).await?,
+                    connect_http(&broadcast_name, url).await?,
                 ));
             }
         }
@@ -87,9 +125,10 @@ impl RpcClients {
     }
 
     pub async fn reconnect_ws(&mut self, expected_chain_id: u64) -> Result<()> {
-        self.ws = tokio::time::timeout(self.request_timeout, connect_ws(&self.ws_url))
-            .await
-            .map_err(|_| BotError::Rpc("WebSocket reconnection timed out".to_string()))??;
+        self.ws =
+            tokio::time::timeout(self.request_timeout, connect_ws("WS_RPC_URL", &self.ws_url))
+                .await
+                .map_err(|_| BotError::Rpc("WebSocket reconnection timed out".to_string()))??;
         let chain_id = tokio::time::timeout(self.request_timeout, self.ws.get_chain_id())
             .await
             .map_err(|_| BotError::Rpc("reconnected WebSocket chain check timed out".to_string()))?
@@ -480,16 +519,16 @@ async fn connect_http(name: &str, url: &str) -> Result<DynProvider<Ethereum>> {
     Ok(ProviderBuilder::new().connect_http(parsed).erased())
 }
 
-async fn connect_ws(url: &str) -> Result<DynProvider<Ethereum>> {
-    let parsed = validate_rpc_url("WS_RPC_URL", url, true)?;
+async fn connect_ws(name: &str, url: &str) -> Result<DynProvider<Ethereum>> {
+    let parsed = validate_rpc_url(name, url, true)?;
     ProviderBuilder::new()
         .connect_ws(WsConnect::new(parsed.to_string()).with_max_retries(10))
         .await
         .map(|provider| provider.erased())
         .map_err(|_| {
-            BotError::Rpc(
-                "WebSocket connection failed; verify WS_RPC_URL and its credentials".to_string(),
-            )
+            BotError::Rpc(format!(
+                "WebSocket connection failed; verify {name} and its credentials"
+            ))
         })
 }
 

@@ -2,7 +2,7 @@ use crate::{
     error::{BotError, Result},
     security::sanitize_external_text,
 };
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, U256, address};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -13,6 +13,11 @@ use zeroize::Zeroizing;
 const OPENSEA_API_BASE: &str = "https://api.opensea.io/api/v2";
 const MAX_RESPONSE_BYTES: u64 = 1_048_576;
 const MAX_CALLDATA_BYTES: usize = 262_144;
+
+/// Canonical OpenSea SeaDrop deployment used as the transaction target for
+/// OpenSea Drops. The configured collection address remains the NFT contract;
+/// SeaDrop is authorized by that contract to perform the stage-aware mint.
+pub const OPENSEA_SEADROP_ADDRESS: Address = address!("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5");
 
 #[derive(Debug, Clone)]
 pub struct OpenSeaMintTransaction {
