@@ -1,8 +1,8 @@
 use crate::{
     config::{
-        GasConfig, INK_MAINNET_CHAIN_ID, MintCallConfig, MintConfig, MintTrigger, NonceStrategy,
-        ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
-        ROBINHOOD_MAINNET_CHAIN_ID,
+        GasConfig, INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE, INK_MAINNET_CHAIN_ID,
+        MintCallConfig, MintConfig, MintTrigger, NonceStrategy, ROBINHOOD_DEFAULT_GAS_LIMIT,
+        ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE, ROBINHOOD_MAINNET_CHAIN_ID,
     },
     error::{BotError, Result},
 };
@@ -23,6 +23,16 @@ use tokio::{
 struct ManualControlInfo {
     port: u16,
     token: String,
+}
+
+fn gas_defaults(chain_id: u64) -> (u64, &'static str) {
+    match chain_id {
+        INK_MAINNET_CHAIN_ID => (INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE),
+        _ => (
+            ROBINHOOD_DEFAULT_GAS_LIMIT,
+            ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
+        ),
+    }
 }
 
 pub fn run_wizard(output: &Path) -> Result<PathBuf> {
@@ -46,9 +56,9 @@ pub fn prompt_interactive_config() -> Result<MintConfig> {
 fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     println!("NFT Mint Setup\n");
     let name = if allow_manual {
-        ask("Collection name", "Example NFT")?
+        Some(ask("Collection name", "Example NFT")?)
     } else {
-        "Robinhood NFT".to_string()
+        None
     };
     let (chain_id, network_name) = if allow_manual {
         let chain_id = ask("Chain ID", "1")?
@@ -70,6 +80,14 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     if let Some(network_name) = network_name {
         println!("Network: {network_name} (chain ID {chain_id})");
     }
+    let (default_gas_limit, default_max_gas_cost_native) = gas_defaults(chain_id);
+    let name = name.unwrap_or_else(|| {
+        if chain_id == INK_MAINNET_CHAIN_ID {
+            "Ink NFT".to_string()
+        } else {
+            "Robinhood NFT".to_string()
+        }
+    });
     let contract_address = ask(
         "Collection contract address",
         "0x0000000000000000000000000000000000000000",
@@ -124,7 +142,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         .parse()
         .map_err(|err| BotError::Config(format!("invalid stage start time: {err}")))?;
         let config = MintConfig {
-            name: "Robinhood NFT".to_string(),
+            name,
             chain_id,
             native_currency: None,
             contract_address,
@@ -143,8 +161,8 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
                 timestamp: stage_start,
             },
             gas: GasConfig {
-                gas_limit: Some(ROBINHOOD_DEFAULT_GAS_LIMIT),
-                max_total_gas_cost_native: Some(ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE.to_string()),
+                gas_limit: Some(default_gas_limit),
+                max_total_gas_cost_native: Some(default_max_gas_cost_native.to_string()),
                 ..GasConfig::default()
             },
             nonce_strategy: NonceStrategy::JustBeforeTrigger,
@@ -195,15 +213,15 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     let gas_limit = if allow_manual {
         ask(
             "Prepared gas limit (required when a closed sale makes estimation revert)",
-            &ROBINHOOD_DEFAULT_GAS_LIMIT.to_string(),
+            &default_gas_limit.to_string(),
         )?
         .parse::<u64>()
         .map_err(|err| BotError::Config(format!("invalid gas limit: {err}")))?
     } else {
         println!(
-            "Gas limit: {ROBINHOOD_DEFAULT_GAS_LIMIT} (automatic default; advanced config can override)"
+            "Gas limit: {default_gas_limit} (automatic default; advanced config can override)"
         );
-        ROBINHOOD_DEFAULT_GAS_LIMIT
+        default_gas_limit
     };
     if allow_manual {
         println!(
@@ -263,7 +281,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         gas: GasConfig {
             gas_limit: Some(gas_limit),
             max_total_gas_cost_native: (!allow_manual)
-                .then(|| ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE.to_string()),
+                .then(|| default_max_gas_cost_native.to_string()),
             ..GasConfig::default()
         },
         nonce_strategy: if allow_manual {
