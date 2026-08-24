@@ -99,11 +99,10 @@ impl OpenSeaClient {
             .map_err(|_| BotError::Transaction("OpenSea API request failed".to_string()))?;
         let status = response.status();
         if !status.is_success() {
+            let message = classify_rejection(status.as_u16(), response).await;
             return Err(BotError::OpenSeaApi {
                 status: status.as_u16(),
-                message:
-                    "request rejected; response body omitted to prevent sensitive-data leakage"
-                        .to_string(),
+                message,
             });
         }
         let response: BuildMintResponse =
@@ -131,11 +130,10 @@ impl OpenSeaClient {
             .map_err(|_| BotError::Transaction("OpenSea API request failed".to_string()))?;
         let status = response.status();
         if !status.is_success() {
+            let message = classify_rejection(status.as_u16(), response).await;
             return Err(BotError::OpenSeaApi {
                 status: status.as_u16(),
-                message:
-                    "request rejected; response body omitted to prevent sensitive-data leakage"
-                        .to_string(),
+                message,
             });
         }
         let body: Value =
@@ -225,6 +223,53 @@ fn parse_u256(value: &str) -> Result<U256> {
         .map_err(|_| BotError::Transaction("OpenSea returned an invalid transaction value".into()))
 }
 
+async fn classify_rejection(status: u16, mut response: Response) -> String {
+    let mut body = Vec::new();
+    while let Ok(Some(chunk)) = response.chunk().await {
+        if body
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length as u64 > MAX_RESPONSE_BYTES)
+        {
+            break;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body = String::from_utf8_lossy(&body);
+    classify_rejection_body(status, &body)
+}
+
+fn classify_rejection_body(status: u16, body: &str) -> String {
+    let body = body.to_ascii_lowercase();
+
+    match status {
+        400 => "invalid mint request".to_string(),
+        401 | 403 => "OpenSea API authorization rejected".to_string(),
+        404 => "drop slug was not found".to_string(),
+        409 => "drop stage is not active".to_string(),
+        422 if body.contains("supply") || body.contains("sold out") => {
+            "supply exhausted or unavailable".to_string()
+        }
+        422 if body.contains("allowlist")
+            || body.contains("eligible")
+            || body.contains("whitelist") =>
+        {
+            "wallet is not eligible for this stage".to_string()
+        }
+        422 if body.contains("limit") || body.contains("maximum") => {
+            "wallet mint limit exceeded".to_string()
+        }
+        422 if body.contains("balance") || body.contains("fund") => {
+            "insufficient native balance for the mint".to_string()
+        }
+        422 => {
+            "OpenSea mint precondition failed (eligibility, limit, balance, or supply)".to_string()
+        }
+        429 => "OpenSea API rate limit reached".to_string(),
+        _ => "request rejected by OpenSea".to_string(),
+    }
+}
+
 async fn read_json_response<T: DeserializeOwned>(
     mut response: Response,
     context: &str,
@@ -259,7 +304,7 @@ async fn read_json_response<T: DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_hex, parse_stage, parse_u256};
+    use super::{classify_rejection_body, decode_hex, parse_stage, parse_u256};
     use serde_json::json;
 
     #[test]
@@ -288,5 +333,13 @@ mod tests {
         assert_eq!(stage.label, "Public");
         assert_eq!(stage.start_time, 1_767_225_600);
         assert_eq!(stage.end_time, Some(1_767_225_600));
+    }
+
+    #[test]
+    fn classifies_safe_rejection_reasons_without_returning_body() {
+        assert_eq!(
+            classify_rejection_body(422, "mint sold out; wallet=0xdeadbeef"),
+            "supply exhausted or unavailable"
+        );
     }
 }
