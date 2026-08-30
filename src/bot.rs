@@ -1,9 +1,15 @@
 use crate::{
     abi::encode_mint,
-    config::{GasMode, MintConfig, MintTrigger, NonceStrategy, parse_gwei, parse_native_amount},
+    config::{
+        GasMode, MintConfig, MintTrigger, NonceStrategy, OpenSeaExecutionMode, parse_gwei,
+        parse_native_amount,
+    },
     error::{BotError, Result},
     metrics::LatencyMetrics,
-    opensea::{OPENSEA_SEADROP_ADDRESS, OpenSeaClient, OpenSeaStage},
+    opensea::{
+        OPENSEA_SEADROP_ADDRESS, OpenSeaClient, OpenSeaDrop, OpenSeaStage, spawn_schedule_refresh,
+        validate_seadrop_calldata,
+    },
     rpc::{RpcClients, simulate_call},
     setup::{bind_manual_control, cleanup_manual_control, prompt_interactive_config},
     state::{AtomicBotState, BotState},
@@ -23,6 +29,7 @@ use std::{
     path::PathBuf,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::watch;
 
 #[derive(Debug, Clone)]
 pub struct PreparedTransaction {
@@ -31,6 +38,7 @@ pub struct PreparedTransaction {
     pub mint_value: U256,
     pub gas_limit: u64,
     pub fee_cap: u128,
+    pub available_balance: U256,
     pub opensea_hydrated: bool,
 }
 
@@ -75,15 +83,32 @@ async fn run_bot_with_config(
 
     state.store(BotState::Preparing);
     let mut prepared = prepare_transaction(&config, &rpc, &wallet).await?;
-    let opensea_stages = if config.opensea_drop_slug.is_some() {
-        load_opensea_stage_schedule(&config).await?
+    let auto_opensea_schedule = config.opensea_drop_slug.is_some()
+        && matches!(
+            &config.trigger,
+            MintTrigger::BlockTimestamp { timestamp: 0 }
+        );
+    let opensea_client = if config.opensea_drop_slug.is_some() {
+        Some(OpenSeaClient::from_env()?)
     } else {
-        Vec::new()
+        None
+    };
+    let opensea_stages = match opensea_client.as_ref() {
+        Some(client) => load_opensea_stage_schedule(&config, client).await?,
+        None => Vec::new(),
     };
     if let Some(stage) = opensea_stages.first() {
         config.trigger = MintTrigger::BlockTimestamp {
             timestamp: stage.start_time,
         };
+    }
+    if let Some(drop_slug) = config.opensea_drop_slug.as_deref() {
+        let configured_contract = config.contract()?;
+        opensea_client
+            .as_ref()
+            .ok_or_else(|| BotError::Config("OpenSea client was not initialized".to_string()))?
+            .verify_collection_contract(drop_slug, config.chain_id, configured_contract)
+            .await?;
     }
     let mut trigger_engine = TriggerEngine::new(&config)?;
     println!("Wallet balance: OK");
@@ -114,8 +139,30 @@ async fn run_bot_with_config(
     let (streams, last_seen_block) = prepare_monitor_streams(&rpc, &trigger_engine, None).await?;
     println!("Subscriptions: READY");
 
+    let (opensea_schedule, opensea_schedule_task) = if !opensea_stages.is_empty() {
+        if auto_opensea_schedule {
+            let client = opensea_client.clone().ok_or_else(|| {
+                BotError::Config("OpenSea client was not initialized".to_string())
+            })?;
+            let drop_slug = config.opensea_drop_slug.clone().ok_or_else(|| {
+                BotError::Config("OpenSea drop slug was not configured".to_string())
+            })?;
+            let (receiver, task) =
+                spawn_schedule_refresh(client, drop_slug, opensea_stages.clone());
+            (Some(receiver), Some(task))
+        } else {
+            let (_sender, receiver) = watch::channel(opensea_stages.clone());
+            (Some(receiver), None)
+        }
+    } else {
+        (None, None)
+    };
+
     state.store(BotState::Armed);
     print_armed(&config, &wallet, &prepared, dry_run);
+    if auto_opensea_schedule {
+        println!("OpenSea schedule: REFRESHING while waiting (5s near a stage, otherwise 30s)");
+    }
     state.store(BotState::WaitingForTrigger);
 
     let mut monitor = MonitorContext {
@@ -131,8 +178,15 @@ async fn run_bot_with_config(
         last_seen_block,
         opensea_stages,
         opensea_stage_index: 0,
+        opensea_client: opensea_client.as_ref(),
+        auto_opensea_schedule,
+        opensea_schedule,
     };
     let result = monitor_until_trigger(&mut monitor, streams).await;
+    if let Some(task) = opensea_schedule_task {
+        task.abort();
+        let _ = task.await;
+    }
     if let Some(path) = control_path {
         cleanup_manual_control(&path);
     }
@@ -195,7 +249,11 @@ pub async fn prepare_transaction(
         )?;
         (calldata.bytes, config.mint_value_wei()?)
     };
-    let nonce = rpc.preload_nonce(wallet.address).await?;
+    let nonce = if uses_cached_nonce(config) {
+        Some(rpc.preload_nonce(wallet.address).await?)
+    } else {
+        None
+    };
     let mut request = TransactionRequest::default()
         .with_from(wallet.address)
         .with_to(contract)
@@ -268,22 +326,43 @@ pub async fn prepare_transaction(
         }
     };
 
-    if !matches!(config.nonce_strategy, NonceStrategy::JustBeforeTrigger) {
+    if let Some(nonce) = nonce {
         request.set_nonce(nonce);
     }
-    validate_transaction_budget(config, rpc, wallet.address, mint_value, gas_limit, fee_cap)
-        .await?;
+    let budgeted_mint_value = if config.opensea_drop_slug.is_some() {
+        // A generic OpenSea 422 can mean insufficient balance. Reserve against
+        // the user's configured maximum before arming so that case is caught
+        // locally and does not look like a transient stage failure.
+        config
+            .maximum_opensea_mint_value_wei()?
+            .unwrap_or(U256::ZERO)
+    } else {
+        mint_value
+    };
+    let available_balance = validate_transaction_budget(
+        config,
+        rpc,
+        wallet.address,
+        budgeted_mint_value,
+        gas_limit,
+        fee_cap,
+    )
+    .await?;
     Ok(PreparedTransaction {
         request,
         calldata,
         mint_value,
         gas_limit,
         fee_cap,
+        available_balance,
         opensea_hydrated: false,
     })
 }
 
-async fn load_opensea_stage_schedule(config: &MintConfig) -> Result<Vec<OpenSeaStage>> {
+async fn load_opensea_stage_schedule(
+    config: &MintConfig,
+    client: &OpenSeaClient,
+) -> Result<Vec<OpenSeaStage>> {
     let Some(drop_slug) = config.opensea_drop_slug.as_deref() else {
         return Ok(Vec::new());
     };
@@ -295,7 +374,9 @@ async fn load_opensea_stage_schedule(config: &MintConfig) -> Result<Vec<OpenSeaS
             ));
         }
     };
-    let stages = OpenSeaClient::from_env()?.get_stages(drop_slug).await?;
+    let drop = client.get_drop(drop_slug).await?;
+    ensure_opensea_supply(&drop, config.quantity)?;
+    let stages = drop.stages;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -326,28 +407,51 @@ async fn hydrate_opensea_transaction(
     wallet: &LoadedWallet,
     prepared: &mut PreparedTransaction,
 ) -> Result<()> {
+    let client = OpenSeaClient::from_env()?;
+    hydrate_opensea_transaction_with_client(config, rpc, wallet, prepared, &client).await
+}
+
+async fn hydrate_opensea_transaction_with_client(
+    config: &MintConfig,
+    rpc: &RpcClients,
+    wallet: &LoadedWallet,
+    prepared: &mut PreparedTransaction,
+    client: &OpenSeaClient,
+) -> Result<()> {
     let Some(drop_slug) = config.opensea_drop_slug.as_deref() else {
         return Ok(());
     };
-    let client = OpenSeaClient::from_env()?;
-    let mint = client
-        .build_mint(drop_slug, wallet.address, config.quantity)
-        .await?;
-    let expected_contract = config.contract()?;
-    if config.opensea_drop_slug.is_some() {
-        if mint.target != OPENSEA_SEADROP_ADDRESS {
-            return Err(BotError::Transaction(format!(
-                "OpenSea returned unsupported transaction target {}; expected the canonical SeaDrop contract {}",
-                mint.target, OPENSEA_SEADROP_ADDRESS
-            )));
+    // These requests do not depend on one another. Overlap them so the
+    // trigger path pays for the slower of the OpenSea request and the fee
+    // estimate, rather than their sum.
+    let build_mint = client.build_mint_with_retry(drop_slug, wallet.address, config.quantity);
+    let estimate_fees = async {
+        if matches!(config.gas.mode, GasMode::Auto) && !is_aggressive_opensea(config) {
+            let mut estimation = rpc.estimate_eip1559_fees().await?;
+            estimation.max_fee_per_gas =
+                scale_u128(estimation.max_fee_per_gas, config.gas.multiplier)?;
+            estimation.max_priority_fee_per_gas =
+                scale_u128(estimation.max_priority_fee_per_gas, config.gas.multiplier)?;
+            Ok(Some(estimation))
+        } else {
+            Ok(None)
         }
-    } else if mint.target != expected_contract {
+    };
+    let (mint, current_fees) = tokio::try_join!(build_mint, estimate_fees)?;
+    if mint.target != OPENSEA_SEADROP_ADDRESS {
         return Err(BotError::Transaction(format!(
-            "OpenSea returned target contract {}, but configuration specifies {}",
-            mint.target, expected_contract
+            "OpenSea returned unsupported transaction target {}; expected the canonical SeaDrop contract {}",
+            mint.target, OPENSEA_SEADROP_ADDRESS
         )));
     }
     validate_opensea_mint_value(config, mint.value)?;
+    validate_seadrop_calldata(
+        &mint.calldata,
+        config.contract()?,
+        wallet.address,
+        config.quantity,
+        mint.value,
+    )?;
 
     let mut request = TransactionRequest::default()
         .with_from(wallet.address)
@@ -368,20 +472,55 @@ async fn hydrate_opensea_transaction(
         request.set_max_priority_fee_per_gas(priority);
     }
 
-    let estimated_gas = rpc.estimate_gas(request.clone()).await.map_err(|err| {
-        BotError::Transaction(format!(
-            "OpenSea transaction gas estimation failed after the stage opened: {err}"
-        ))
-    })?;
-    let configured_limit = config.gas.gas_limit.unwrap_or_default();
-    let gas_limit = scale_u64(estimated_gas.max(configured_limit), config.gas.multiplier)?;
+    let fee_cap = if let Some(estimation) = current_fees {
+        request.set_max_fee_per_gas(estimation.max_fee_per_gas);
+        request.set_max_priority_fee_per_gas(estimation.max_priority_fee_per_gas);
+        estimation.max_fee_per_gas
+    } else {
+        prepared.fee_cap
+    };
+
+    let gas_limit = if is_aggressive_opensea(config) {
+        let configured = config
+            .gas
+            .gas_limit
+            .or(prepared.request.gas)
+            .ok_or_else(|| {
+                BotError::Config(
+                "aggressive OpenSea mode requires gas.gas_limit because gas estimation is skipped"
+                    .to_string(),
+            )
+            })?;
+        scale_u64(configured, config.gas.multiplier)?
+    } else {
+        let estimated_gas = rpc.estimate_gas(request.clone()).await.map_err(|err| {
+            BotError::Transaction(format!(
+                "OpenSea transaction gas estimation failed after the stage opened: {err}"
+            ))
+        })?;
+        select_opensea_gas_limit(estimated_gas, config.gas.gas_limit, config.gas.multiplier)?
+    };
     request.set_gas_limit(gas_limit);
+    let available_balance = if is_aggressive_opensea(config) {
+        validate_transaction_budget_with_balance(
+            config,
+            prepared.available_balance,
+            mint.value,
+            gas_limit,
+            fee_cap,
+        )?;
+        prepared.available_balance
+    } else {
+        validate_transaction_budget(config, rpc, wallet.address, mint.value, gas_limit, fee_cap)
+            .await?
+    };
     prepared.request = request;
     prepared.calldata = mint.calldata;
     prepared.mint_value = mint.value;
     prepared.gas_limit = gas_limit;
+    prepared.fee_cap = fee_cap;
+    prepared.available_balance = available_balance;
     prepared.opensea_hydrated = true;
-    refresh_transaction_fields(config, rpc, wallet, prepared).await?;
     Ok(())
 }
 
@@ -410,6 +549,18 @@ async fn validate_transaction_budget(
     mint_value: U256,
     gas_limit: u64,
     fee_cap: u128,
+) -> Result<U256> {
+    let balance = rpc.check_balance(wallet).await?;
+    validate_transaction_budget_with_balance(config, balance, mint_value, gas_limit, fee_cap)?;
+    Ok(balance)
+}
+
+fn validate_transaction_budget_with_balance(
+    config: &MintConfig,
+    balance: U256,
+    mint_value: U256,
+    gas_limit: u64,
+    fee_cap: u128,
 ) -> Result<()> {
     let maximum_gas_cost = U256::from(gas_limit)
         .checked_mul(U256::from(fee_cap))
@@ -423,7 +574,6 @@ async fn validate_transaction_budget(
             });
         }
     }
-    let balance = rpc.check_balance(wallet).await?;
     let required = mint_value
         .checked_add(maximum_gas_cost)
         .ok_or_else(|| BotError::Transaction("required balance overflowed U256".to_string()))?;
@@ -449,6 +599,9 @@ struct MonitorContext<'a> {
     last_seen_block: Option<u64>,
     opensea_stages: Vec<OpenSeaStage>,
     opensea_stage_index: usize,
+    opensea_client: Option<&'a OpenSeaClient>,
+    auto_opensea_schedule: bool,
+    opensea_schedule: Option<watch::Receiver<Vec<OpenSeaStage>>>,
 }
 
 enum MonitorStreams {
@@ -609,6 +762,9 @@ async fn monitor_block_stream(
                     return Err(MonitorFailure::Transport(BotError::Rpc("block subscription closed".to_string())));
                 };
                 context.last_seen_block = Some(header.number());
+                if let Err(err) = context.apply_opensea_schedule_update() {
+                    return Err(MonitorFailure::Execution(err));
+                }
                 let number = header.number();
                 match context
                     .trigger_engine
@@ -678,6 +834,9 @@ async fn monitor_event_stream(
                     return Err(MonitorFailure::Transport(BotError::Rpc("block subscription closed".to_string())));
                 };
                 context.last_seen_block = Some(header.number());
+                if let Err(err) = context.apply_opensea_schedule_update() {
+                    return Err(MonitorFailure::Execution(err));
+                }
                 let observation = context
                     .trigger_engine
                     .observe_block(&header, context.rpc)
@@ -906,11 +1065,15 @@ async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bo
         return Ok(false);
     }
     if context.config.opensea_drop_slug.is_some() && !context.prepared.opensea_hydrated {
-        let hydration = hydrate_opensea_transaction(
+        let client = context
+            .opensea_client
+            .ok_or_else(|| BotError::Config("OpenSea client was not initialized".to_string()))?;
+        let hydration = hydrate_opensea_transaction_with_client(
             context.config,
             context.rpc,
             context.wallet,
             context.prepared,
+            client,
         )
         .await;
         if let Err(err) = hydration {
@@ -921,8 +1084,50 @@ async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bo
                     ..
                 }
             );
-            if stage_unavailable && advance_opensea_stage(context)? {
-                return Ok(false);
+            if stage_unavailable {
+                if context.auto_opensea_schedule && context.refresh_opensea_schedule_now().await? {
+                    return Ok(false);
+                }
+                if is_advanceable_opensea_rejection(&err) {
+                    if advance_opensea_stage(context)? {
+                        return Ok(false);
+                    }
+                } else if context.auto_opensea_schedule && is_ambiguous_opensea_precondition(&err) {
+                    // A bare 422 does not tell us whether the API is briefly
+                    // behind the active stage or whether a hard precondition
+                    // failed. Retrying preserves an eligible mint window. Only
+                    // move on once the next scheduled stage has actually begun.
+                    if advance_to_started_opensea_stage(context)? {
+                        return Ok(false);
+                    }
+                    let delay_seconds = if is_aggressive_opensea(context.config) {
+                        0
+                    } else {
+                        2
+                    };
+                    context.defer_automatic_opensea_retry(delay_seconds)?;
+                    let label = context
+                        .opensea_stages
+                        .get(context.opensea_stage_index)
+                        .map_or("current stage", |stage| stage.label.as_str());
+                    println!(
+                        "[WARN] OpenSea returned an ambiguous validation failure for {label}; retrying the same stage"
+                    );
+                    return Ok(false);
+                } else if context.auto_opensea_schedule
+                    && is_opensea_stage_not_active_rejection(&err)
+                {
+                    // OpenSea can lag the chain at the exact stage boundary.
+                    // Keep the current trigger armed and retry on the next block
+                    // instead of skipping a potentially eligible stage.
+                    let delay_seconds = if is_aggressive_opensea(context.config) {
+                        0
+                    } else {
+                        2
+                    };
+                    context.defer_automatic_opensea_retry(delay_seconds)?;
+                    return Ok(false);
+                }
             }
             return Err(err);
         }
@@ -930,15 +1135,164 @@ async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bo
     Ok(true)
 }
 
+impl MonitorContext<'_> {
+    fn defer_automatic_opensea_retry(&mut self, delay_seconds: u64) -> Result<()> {
+        if !self.auto_opensea_schedule {
+            return Ok(());
+        }
+        let retry_at = automatic_opensea_retry_timestamp(delay_seconds);
+        self.trigger_engine.set_block_timestamp(retry_at)?;
+        self.prepared.opensea_hydrated = false;
+        Ok(())
+    }
+
+    fn apply_opensea_schedule_update(&mut self) -> Result<()> {
+        if !self.auto_opensea_schedule {
+            return Ok(());
+        }
+        let Some(schedule) = self.opensea_schedule.as_mut() else {
+            return Ok(());
+        };
+        if !schedule.has_changed().unwrap_or(false) {
+            return Ok(());
+        }
+
+        let updated = schedule.borrow_and_update().clone();
+        if updated.is_empty() {
+            return Ok(());
+        }
+        let selected_index =
+            refreshed_stage_index(&self.opensea_stages, self.opensea_stage_index, &updated);
+        let stage = updated[selected_index].clone();
+        self.opensea_stages = updated;
+        self.opensea_stage_index = selected_index;
+        self.prepared.opensea_hydrated = false;
+        self.trigger_engine.set_block_timestamp(stage.start_time)?;
+        println!(
+            "[INFO] OpenSea schedule refreshed; selected {} at Unix timestamp {}",
+            stage.label, stage.start_time
+        );
+        Ok(())
+    }
+
+    async fn refresh_opensea_schedule_now(&mut self) -> Result<bool> {
+        let Some(drop_slug) = self.config.opensea_drop_slug.as_deref() else {
+            return Ok(false);
+        };
+        let Some(client) = self.opensea_client else {
+            return Ok(false);
+        };
+        let drop = match client.get_drop(drop_slug).await {
+            Ok(drop) => drop,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "OpenSea stage schedule refresh after a rejected mint request failed"
+                );
+                return Ok(false);
+            }
+        };
+        ensure_opensea_supply(&drop, self.config.quantity)?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let mut stages = drop
+            .stages
+            .into_iter()
+            .filter(|stage| stage.end_time.is_none_or(|end_time| end_time >= now))
+            .collect::<Vec<_>>();
+        stages.sort_by_key(|stage| stage.start_time);
+        if stages.is_empty() || stages == self.opensea_stages {
+            return Ok(false);
+        }
+        let selected_index =
+            refreshed_stage_index(&self.opensea_stages, self.opensea_stage_index, &stages);
+        let stage = stages[selected_index].clone();
+        self.opensea_stages = stages;
+        self.opensea_stage_index = selected_index;
+        self.prepared.opensea_hydrated = false;
+        self.trigger_engine.set_block_timestamp(stage.start_time)?;
+        println!(
+            "[INFO] OpenSea schedule refreshed after rejection; selected {} at Unix timestamp {}",
+            stage.label, stage.start_time
+        );
+        Ok(true)
+    }
+}
+
+fn is_opensea_stage_not_active_rejection(error: &BotError) -> bool {
+    matches!(error, BotError::OpenSeaApi { status: 409, .. })
+}
+
+fn is_advanceable_opensea_rejection(error: &BotError) -> bool {
+    matches!(
+        error,
+        BotError::OpenSeaApi {
+            status: 422,
+            message,
+        } if message == "wallet is not eligible for this stage"
+            || message == "supply exhausted or unavailable"
+            || message == "wallet mint limit exceeded"
+    )
+}
+
+fn is_ambiguous_opensea_precondition(error: &BotError) -> bool {
+    matches!(
+        error,
+        BotError::OpenSeaApi {
+            status: 422,
+            message,
+        } if message == "OpenSea mint precondition failed (eligibility, limit, balance, or supply)"
+    )
+}
+
+fn advance_to_started_opensea_stage(context: &mut MonitorContext<'_>) -> Result<bool> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if !next_opensea_stage_has_started(&context.opensea_stages, context.opensea_stage_index, now) {
+        return Ok(false);
+    }
+    advance_opensea_stage(context)
+}
+
+fn next_opensea_stage_has_started(stages: &[OpenSeaStage], current_index: usize, now: u64) -> bool {
+    next_opensea_stage(stages, current_index)
+        .is_some_and(|(_, next_stage)| next_stage.start_time <= now)
+}
+
+fn ensure_opensea_supply(drop: &OpenSeaDrop, quantity: u64) -> Result<()> {
+    let Some(remaining) = drop.remaining_supply() else {
+        return Ok(());
+    };
+    if remaining < U256::from(quantity) {
+        return Err(BotError::Transaction(format!(
+            "OpenSea drop has {remaining} NFTs remaining, fewer than the requested quantity {quantity}"
+        )));
+    }
+    Ok(())
+}
+
 fn advance_opensea_stage(context: &mut MonitorContext<'_>) -> Result<bool> {
-    let Some(next_stage) = context
-        .opensea_stages
-        .get(context.opensea_stage_index.saturating_add(1))
-        .cloned()
+    let Some((next_index, next_stage)) =
+        next_opensea_stage(&context.opensea_stages, context.opensea_stage_index)
+            .map(|(index, stage)| (index, stage.clone()))
     else {
+        if context.auto_opensea_schedule {
+            // A later stage may not be published by OpenSea yet. Keep the
+            // monitor alive and let the background schedule refresh discover
+            // it, but avoid retrying the mint endpoint on every block.
+            context.defer_automatic_opensea_retry(5)?;
+            println!(
+                "[INFO] OpenSea stage unavailable; no later stage is published yet, continuing automatic monitoring"
+            );
+            return Ok(true);
+        }
         return Ok(false);
     };
-    context.opensea_stage_index = context.opensea_stage_index.saturating_add(1);
+    context.opensea_stage_index = next_index;
     context
         .trigger_engine
         .set_block_timestamp(next_stage.start_time)?;
@@ -950,22 +1304,90 @@ fn advance_opensea_stage(context: &mut MonitorContext<'_>) -> Result<bool> {
     Ok(true)
 }
 
+fn next_opensea_stage(
+    stages: &[OpenSeaStage],
+    current_index: usize,
+) -> Option<(usize, &OpenSeaStage)> {
+    let next_index = current_index.saturating_add(1);
+    stages.get(next_index).map(|stage| (next_index, stage))
+}
+
+fn refreshed_stage_index(
+    previous: &[OpenSeaStage],
+    previous_index: usize,
+    updated: &[OpenSeaStage],
+) -> usize {
+    let Some(selected) = previous.get(previous_index) else {
+        return previous_index.min(updated.len().saturating_sub(1));
+    };
+    updated
+        .iter()
+        .position(|stage| stage == selected)
+        .or_else(|| {
+            updated
+                .iter()
+                .position(|stage| stage.label == selected.label)
+        })
+        .or_else(|| {
+            updated
+                .iter()
+                .position(|stage| stage.start_time >= selected.start_time)
+        })
+        .unwrap_or_else(|| previous_index.min(updated.len().saturating_sub(1)))
+}
+
+fn automatic_opensea_retry_timestamp(delay_seconds: u64) -> u64 {
+    if delay_seconds == 0 {
+        // The current block has already been processed, so zero makes the
+        // trigger ready on the next block without relying on wall-clock skew.
+        return 0;
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_add(delay_seconds)
+}
+
 async fn refresh_transaction_fields(
     config: &MintConfig,
     rpc: &RpcClients,
     wallet: &LoadedWallet,
     prepared: &mut PreparedTransaction,
 ) -> Result<()> {
-    if matches!(config.nonce_strategy, NonceStrategy::RefreshEachBlock) {
-        prepared
-            .request
-            .set_nonce(rpc.preload_nonce(wallet.address).await?);
+    // Normal OpenSea mode deliberately obtains fresh fees, gas, balance, and
+    // nonce after OpenSea returns the final calldata. Refreshing those same
+    // fields on every waiting block only consumes RPC quota and can turn an
+    // irrelevant transient read failure into trigger-path latency.
+    if config.opensea_drop_slug.is_some() && !is_aggressive_opensea(config) {
+        return Ok(());
     }
-    if matches!(config.gas.mode, GasMode::Auto) {
-        let mut estimation = rpc.estimate_eip1559_fees().await?;
-        estimation.max_fee_per_gas = scale_u128(estimation.max_fee_per_gas, config.gas.multiplier)?;
-        estimation.max_priority_fee_per_gas =
-            scale_u128(estimation.max_priority_fee_per_gas, config.gas.multiplier)?;
+    let refresh_nonce = matches!(config.nonce_strategy, NonceStrategy::RefreshEachBlock)
+        || is_aggressive_opensea(config);
+    let nonce = async {
+        if refresh_nonce {
+            Ok(Some(rpc.preload_nonce(wallet.address).await?))
+        } else {
+            Ok(None)
+        }
+    };
+    let fees = async {
+        if matches!(config.gas.mode, GasMode::Auto) {
+            let mut estimation = rpc.estimate_eip1559_fees().await?;
+            estimation.max_fee_per_gas =
+                scale_u128(estimation.max_fee_per_gas, config.gas.multiplier)?;
+            estimation.max_priority_fee_per_gas =
+                scale_u128(estimation.max_priority_fee_per_gas, config.gas.multiplier)?;
+            Ok(Some(estimation))
+        } else {
+            Ok(None)
+        }
+    };
+    let (nonce, fees, balance) = tokio::try_join!(nonce, fees, rpc.check_balance(wallet.address))?;
+    if let Some(nonce) = nonce {
+        prepared.request.set_nonce(nonce);
+    }
+    if let Some(estimation) = fees {
         prepared
             .request
             .set_max_fee_per_gas(estimation.max_fee_per_gas);
@@ -974,15 +1396,15 @@ async fn refresh_transaction_fields(
             .set_max_priority_fee_per_gas(estimation.max_priority_fee_per_gas);
         prepared.fee_cap = estimation.max_fee_per_gas;
     }
-    validate_transaction_budget(
+    validate_transaction_budget_with_balance(
         config,
-        rpc,
-        wallet.address,
+        balance,
         prepared.mint_value,
         prepared.gas_limit,
         prepared.fee_cap,
-    )
-    .await
+    )?;
+    prepared.available_balance = balance;
+    Ok(())
 }
 
 async fn execute_transaction(
@@ -1011,9 +1433,11 @@ async fn execute_transaction(
     }
 
     metrics.finalization_started = Some(Instant::now());
-    let nonce_lock = WalletNonceLock::acquire(wallet.address).await?;
+    let nonce_lock = WalletNonceLock::acquire(config.chain_id, wallet.address).await?;
     let mut request = prepared.request.clone();
-    if !matches!(config.nonce_strategy, NonceStrategy::Preloaded) {
+    if !uses_cached_nonce(config) || nonce_lock.was_contended() {
+        // A cached nonce is no longer trustworthy after waiting for another
+        // bot process using the same wallet to release its cross-process lock.
         request.set_nonce(rpc.preload_nonce(wallet.address).await?);
     }
     metrics.finalization_completed = Some(Instant::now());
@@ -1236,7 +1660,9 @@ fn exceeds_gas_cap(config: &MintConfig, request: &TransactionRequest) -> bool {
         .gas_price
         .or(request.max_fee_per_gas)
         .unwrap_or_default();
-    U256::from(request.gas.unwrap_or_default()) * U256::from(fee) > cap
+    U256::from(request.gas.unwrap_or_default())
+        .checked_mul(U256::from(fee))
+        .is_none_or(|cost| cost > cap)
 }
 
 fn scale_u64(value: u64, multiplier: f64) -> Result<u64> {
@@ -1247,6 +1673,30 @@ fn scale_u64(value: u64, multiplier: f64) -> Result<u64> {
         ));
     }
     Ok(scaled as u64)
+}
+
+fn is_aggressive_opensea(config: &MintConfig) -> bool {
+    config.opensea_drop_slug.is_some()
+        && matches!(
+            config.opensea_execution_mode,
+            OpenSeaExecutionMode::Aggressive
+        )
+}
+
+fn uses_cached_nonce(config: &MintConfig) -> bool {
+    matches!(
+        config.nonce_strategy,
+        NonceStrategy::Preloaded | NonceStrategy::RefreshEachBlock
+    ) || is_aggressive_opensea(config)
+}
+
+fn select_opensea_gas_limit(
+    estimated: u64,
+    configured_default: Option<u64>,
+    multiplier: f64,
+) -> Result<u64> {
+    let base = configured_default.map_or(estimated, |configured| configured.max(estimated));
+    scale_u64(base, multiplier)
 }
 
 fn scale_u128(value: u128, multiplier: f64) -> Result<u128> {
@@ -1273,6 +1723,15 @@ fn print_armed(
     if let Some(slug) = config.opensea_drop_slug.as_deref() {
         println!("OpenSea drop: {slug}");
         println!("Mint value: fetched from OpenSea when the stage is active");
+        println!(
+            "OpenSea execution: {}",
+            match config.opensea_execution_mode {
+                OpenSeaExecutionMode::Normal => "normal (fresh gas simulation)",
+                OpenSeaExecutionMode::Aggressive => {
+                    "aggressive (configured gas limit; gas simulation skipped)"
+                }
+            }
+        );
         if config.require_zero_value {
             println!("Price guard: REQUIRED FREE MINT (nonzero value will abort)");
         } else if let Some(maximum_per_nft) = config.max_price_per_nft.as_deref()
@@ -1298,9 +1757,9 @@ fn print_armed(
             |nonce| nonce.to_string()
         )
     );
-    if matches!(config.nonce_strategy, NonceStrategy::Preloaded) {
+    if uses_cached_nonce(config) {
         println!(
-            "WARNING: do not send other transactions from this wallet while the bot is armed."
+            "WARNING: do not send other transactions from this wallet while the bot is armed; the cached nonce could become stale."
         );
     }
     if dry_run {
@@ -1358,8 +1817,16 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_opensea_mint_value;
-    use crate::config::MintConfig;
+    use super::{
+        automatic_opensea_retry_timestamp, ensure_opensea_supply, is_advanceable_opensea_rejection,
+        is_aggressive_opensea, is_ambiguous_opensea_precondition,
+        is_opensea_stage_not_active_rejection, next_opensea_stage, next_opensea_stage_has_started,
+        refreshed_stage_index, select_opensea_gas_limit, uses_cached_nonce,
+        validate_opensea_mint_value, validate_transaction_budget_with_balance,
+    };
+    use crate::config::{MintConfig, OpenSeaExecutionMode};
+    use crate::error::BotError;
+    use crate::opensea::{OpenSeaDrop, OpenSeaStage};
     use alloy::primitives::U256;
 
     fn opensea_config(require_zero_value: bool, maximum: Option<&str>) -> MintConfig {
@@ -1392,5 +1859,167 @@ mod tests {
         let config = opensea_config(true, Some("0"));
         assert!(validate_opensea_mint_value(&config, U256::ZERO).is_ok());
         assert!(validate_opensea_mint_value(&config, U256::from(1)).is_err());
+    }
+
+    #[test]
+    fn aggressive_opensea_uses_the_refreshed_nonce_cache() {
+        let mut config = opensea_config(true, Some("0"));
+        assert!(!is_aggressive_opensea(&config));
+        config.opensea_execution_mode = OpenSeaExecutionMode::Aggressive;
+        assert!(is_aggressive_opensea(&config));
+        assert!(uses_cached_nonce(&config));
+    }
+
+    #[test]
+    fn refresh_each_block_nonce_strategy_uses_its_cached_nonce() {
+        let mut config = opensea_config(true, Some("0"));
+        config.opensea_drop_slug = None;
+        config.nonce_strategy = crate::config::NonceStrategy::RefreshEachBlock;
+        assert!(uses_cached_nonce(&config));
+    }
+
+    #[test]
+    fn zero_delay_opensea_retry_is_ready_on_the_next_block() {
+        assert_eq!(automatic_opensea_retry_timestamp(0), 0);
+        assert!(automatic_opensea_retry_timestamp(2) >= 2);
+    }
+
+    #[test]
+    fn cached_balance_budget_check_keeps_payment_and_gas_caps() {
+        let mut config = opensea_config(false, Some("1"));
+        config.gas.max_total_gas_cost_native = Some("0.001".to_string());
+        assert!(
+            validate_transaction_budget_with_balance(
+                &config,
+                U256::from(100),
+                U256::from(80),
+                10,
+                2,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_transaction_budget_with_balance(
+                &config,
+                U256::from(99),
+                U256::from(80),
+                10,
+                2,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn opensea_gas_limit_never_uses_less_than_the_live_estimate() {
+        assert_eq!(
+            select_opensea_gas_limit(250_000, Some(200_000), 1.15).unwrap(),
+            287_500
+        );
+        assert_eq!(
+            select_opensea_gas_limit(150_000, Some(200_000), 1.15).unwrap(),
+            230_000
+        );
+    }
+
+    #[test]
+    fn only_stage_or_eligibility_failures_advance_the_stage() {
+        let not_active = BotError::OpenSeaApi {
+            status: 409,
+            message: "drop stage is not active".to_string(),
+        };
+        assert!(is_opensea_stage_not_active_rejection(&not_active));
+        assert!(!is_advanceable_opensea_rejection(&not_active));
+
+        let ineligible = BotError::OpenSeaApi {
+            status: 422,
+            message: "wallet is not eligible for this stage".to_string(),
+        };
+        assert!(is_advanceable_opensea_rejection(&ineligible));
+
+        let stage_limit = BotError::OpenSeaApi {
+            status: 422,
+            message: "wallet mint limit exceeded".to_string(),
+        };
+        assert!(is_advanceable_opensea_rejection(&stage_limit));
+
+        let balance = BotError::OpenSeaApi {
+            status: 422,
+            message: "insufficient native balance for the mint".to_string(),
+        };
+        assert!(!is_advanceable_opensea_rejection(&balance));
+
+        let ambiguous_precondition = BotError::OpenSeaApi {
+            status: 422,
+            message: "OpenSea mint precondition failed (eligibility, limit, balance, or supply)"
+                .to_string(),
+        };
+        assert!(!is_advanceable_opensea_rejection(&ambiguous_precondition));
+        assert!(is_ambiguous_opensea_precondition(&ambiguous_precondition));
+    }
+
+    #[test]
+    fn automatic_stage_cursor_can_move_after_a_previous_phase_was_used() {
+        let stages = vec![
+            OpenSeaStage {
+                label: "GTD".to_string(),
+                start_time: 100,
+                end_time: Some(200),
+            },
+            OpenSeaStage {
+                label: "FCFS".to_string(),
+                start_time: 300,
+                end_time: Some(400),
+            },
+        ];
+
+        let (index, next) = next_opensea_stage(&stages, 0).expect("FCFS should follow GTD");
+        assert_eq!(index, 1);
+        assert_eq!(next.label, "FCFS");
+        assert!(!next_opensea_stage_has_started(&stages, 0, 299));
+        assert!(next_opensea_stage_has_started(&stages, 0, 300));
+        assert!(next_opensea_stage(&stages, index).is_none());
+    }
+
+    #[test]
+    fn live_drop_supply_must_cover_the_requested_quantity() {
+        let drop = OpenSeaDrop {
+            stages: Vec::new(),
+            total_supply: Some(U256::from(3_332)),
+            max_supply: Some(U256::from(3_333)),
+        };
+        assert!(ensure_opensea_supply(&drop, 1).is_ok());
+        assert!(ensure_opensea_supply(&drop, 2).is_err());
+    }
+
+    #[test]
+    fn schedule_refresh_preserves_the_selected_later_stage() {
+        let previous = vec![
+            OpenSeaStage {
+                label: "GTD".to_string(),
+                start_time: 100,
+                end_time: Some(200),
+            },
+            OpenSeaStage {
+                label: "FCFS".to_string(),
+                start_time: 300,
+                end_time: Some(400),
+            },
+        ];
+        let updated = vec![
+            previous[0].clone(),
+            OpenSeaStage {
+                label: "FCFS".to_string(),
+                start_time: 290,
+                end_time: Some(400),
+            },
+            OpenSeaStage {
+                label: "Public".to_string(),
+                start_time: 500,
+                end_time: None,
+            },
+        ];
+
+        assert_eq!(refreshed_stage_index(&previous, 1, &updated), 1);
     }
 }

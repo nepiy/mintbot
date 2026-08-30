@@ -58,35 +58,53 @@ impl LoadedWallet {
 
 pub struct WalletNonceLock {
     _file: std::fs::File,
+    contended: bool,
 }
 
 impl WalletNonceLock {
-    pub async fn acquire(address: alloy::primitives::Address) -> Result<Self> {
-        let digest = keccak256(address.as_slice());
+    pub async fn acquire(chain_id: u64, address: alloy::primitives::Address) -> Result<Self> {
+        let mut identity = chain_id.to_be_bytes().to_vec();
+        identity.extend_from_slice(address.as_slice());
+        let digest = keccak256(identity);
         let path = std::env::temp_dir().join(format!(
             "nft-mint-bot-wallet-{}.lock",
             hex::encode(&digest[..12])
         ));
-        let file = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-            let mut options = OpenOptions::new();
-            options.read(true).write(true).create(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let file = options.open(path)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-            }
-            file.lock()?;
-            Ok(file)
+        let (file, contended) =
+            tokio::task::spawn_blocking(move || -> std::io::Result<(std::fs::File, bool)> {
+                let mut options = OpenOptions::new();
+                options.read(true).write(true).create(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                let file = options.open(path)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+                }
+                let contended = match file.try_lock() {
+                    Ok(()) => false,
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        file.lock()?;
+                        true
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => return Err(error),
+                };
+                Ok((file, contended))
+            })
+            .await
+            .map_err(|err| BotError::Wallet(format!("nonce lock task failed: {err}")))??;
+        Ok(Self {
+            _file: file,
+            contended,
         })
-        .await
-        .map_err(|err| BotError::Wallet(format!("nonce lock task failed: {err}")))??;
-        Ok(Self { _file: file })
+    }
+
+    pub fn was_contended(&self) -> bool {
+        self.contended
     }
 }
 

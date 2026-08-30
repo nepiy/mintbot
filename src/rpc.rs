@@ -19,6 +19,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+const CRITICAL_READ_SETTLE_WINDOW: Duration = Duration::from_millis(75);
+// Gas estimates are already protected by the configured gas default and
+// multiplier. Keep a short cross-provider window for a higher estimate
+// without adding the full consistency delay to the mint critical path.
+const GAS_ESTIMATE_SETTLE_WINDOW: Duration = Duration::from_millis(25);
+
 #[derive(Clone)]
 pub struct RpcClients {
     pub http: DynProvider<Ethereum>,
@@ -144,6 +150,7 @@ impl RpcClients {
                 reported: chain_id,
             });
         }
+        self.replace_websocket_broadcast_endpoint();
         Ok(())
     }
 
@@ -190,9 +197,25 @@ impl RpcClients {
         }
         self.http = healthy[0].1.clone();
         let healthy = Arc::new(healthy);
-        self.broadcast = Arc::clone(&healthy);
+        let mut broadcast = Vec::with_capacity(healthy.len().saturating_add(1));
+        // The already-connected WebSocket can often accept the raw
+        // transaction sooner than a newly-idle HTTP connection. Keep the HTTP
+        // endpoints as concurrent fallbacks.
+        broadcast.push(("ws".to_string(), self.ws.clone()));
+        broadcast.extend(healthy.iter().cloned());
+        self.broadcast = Arc::new(broadcast);
         self.read = healthy;
         Ok(())
+    }
+
+    fn replace_websocket_broadcast_endpoint(&mut self) {
+        let mut broadcast = self.broadcast.as_ref().clone();
+        if let Some((_, provider)) = broadcast.iter_mut().find(|(name, _)| name == "ws") {
+            *provider = self.ws.clone();
+        } else {
+            broadcast.insert(0, ("ws".to_string(), self.ws.clone()));
+        }
+        self.broadcast = Arc::new(broadcast);
     }
 
     pub async fn validate_contract(&self, config: &MintConfig) -> Result<()> {
@@ -251,7 +274,7 @@ impl RpcClients {
     }
 
     pub async fn preload_nonce(&self, address: Address) -> Result<u64> {
-        self.read_all("eth_getTransactionCount", move |provider| async move {
+        self.read_critical("eth_getTransactionCount", move |provider| async move {
             provider.get_transaction_count(address).pending().await
         })
         .await?
@@ -261,7 +284,7 @@ impl RpcClients {
     }
 
     pub async fn check_balance(&self, address: Address) -> Result<U256> {
-        self.read_all("eth_getBalance", move |provider| async move {
+        self.read_critical("eth_getBalance", move |provider| async move {
             provider.get_balance(address).await
         })
         .await?
@@ -271,10 +294,14 @@ impl RpcClients {
     }
 
     pub async fn estimate_gas(&self, request: TransactionRequest) -> Result<u64> {
-        self.read_all("eth_estimateGas", move |provider| {
-            let request = request.clone();
-            async move { provider.estimate_gas(request).await }
-        })
+        self.read_critical_with_window(
+            "eth_estimateGas",
+            move |provider| {
+                let request = request.clone();
+                async move { provider.estimate_gas(request).await }
+            },
+            GAS_ESTIMATE_SETTLE_WINDOW,
+        )
         .await?
         .into_iter()
         .max()
@@ -283,7 +310,7 @@ impl RpcClients {
 
     pub async fn estimate_eip1559_fees(&self) -> Result<Eip1559Estimation> {
         let estimates = self
-            .read_all("eth_feeHistory", move |provider| async move {
+            .read_critical("eth_feeHistory", move |provider| async move {
                 provider.estimate_eip1559_fees().await
             })
             .await?;
@@ -301,16 +328,27 @@ impl RpcClients {
     }
 
     pub async fn call_at(&self, request: TransactionRequest, block: BlockId) -> Result<Vec<u8>> {
-        self.read_fallback("eth_call", move |provider| {
-            let request = request.clone();
-            async move { provider.call(request).block(block).await }
-        })
-        .await
-        .map(Into::into)
+        let values = self
+            .read_critical("eth_call", move |provider| {
+                let request = request.clone();
+                async move { provider.call(request).block(block).await }
+            })
+            .await?;
+        let Some(first) = values.first() else {
+            return Err(BotError::Rpc(
+                "no provider returned a view-call result".to_string(),
+            ));
+        };
+        if values.iter().skip(1).any(|value| value != first) {
+            return Err(BotError::Rpc(
+                "RPC providers returned conflicting view-call results".to_string(),
+            ));
+        }
+        Ok(first.clone().into())
     }
 
     pub async fn block_number(&self) -> Result<u64> {
-        self.read_all("eth_blockNumber", move |provider| async move {
+        self.read_critical("eth_blockNumber", move |provider| async move {
             provider.get_block_number().await
         })
         .await?
@@ -325,7 +363,17 @@ impl RpcClients {
                 provider.get_transaction_receipt(hash).await
             })
             .await?;
-        Ok(receipts.into_iter().flatten().next())
+        let mut present = receipts.into_iter().flatten();
+        let Some(first) = present.next() else {
+            return Ok(None);
+        };
+        if present.any(|receipt| receipt != first) {
+            return Err(BotError::Rpc(
+                "RPC providers returned conflicting receipts; waiting for a consistent result"
+                    .to_string(),
+            ));
+        }
+        Ok(Some(first))
     }
 
     pub async fn logs(&self, filter: Filter) -> Result<Vec<Log>> {
@@ -348,38 +396,6 @@ impl RpcClients {
             }
         }
         Ok(merged)
-    }
-
-    async fn read_fallback<T, E, F, Fut>(&self, operation: &str, call: F) -> Result<T>
-    where
-        F: Fn(DynProvider<Ethereum>) -> Fut,
-        Fut: std::future::Future<Output = std::result::Result<T, E>>,
-        E: std::fmt::Display,
-    {
-        let mut calls = FuturesUnordered::new();
-        for (name, provider) in self.read.iter().cloned() {
-            let future = call(provider);
-            let timeout = self.request_timeout;
-            calls.push(async move {
-                let result = tokio::time::timeout(timeout, future).await;
-                (name, result)
-            });
-        }
-
-        let mut failures = Vec::new();
-        while let Some((name, result)) = calls.next().await {
-            match result {
-                Ok(Ok(value)) => return Ok(value),
-                Ok(Err(err)) => {
-                    failures.push(format!("{name}: {}", summarize_rpc_error(&err.to_string())))
-                }
-                Err(_) => failures.push(format!("{name}: timed out")),
-            }
-        }
-        Err(BotError::Rpc(format!(
-            "{operation} failed on every healthy provider: {}",
-            failures.join("; ")
-        )))
     }
 
     async fn read_all<T, E, F, Fut>(&self, operation: &str, call: F) -> Result<Vec<T>>
@@ -418,6 +434,73 @@ impl RpcClients {
         Ok(values)
     }
 
+    /// Fan out a trigger-critical read, then keep only a short consistency
+    /// window open after the first successful response. This retains a chance
+    /// to compare/aggregate fast providers without putting a slow backup RPC
+    /// on the transaction's critical path.
+    async fn read_critical<T, E, F, Fut>(&self, operation: &str, call: F) -> Result<Vec<T>>
+    where
+        F: Fn(DynProvider<Ethereum>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        self.read_critical_with_window(operation, call, CRITICAL_READ_SETTLE_WINDOW)
+            .await
+    }
+
+    async fn read_critical_with_window<T, E, F, Fut>(
+        &self,
+        operation: &str,
+        call: F,
+        settle_window: Duration,
+    ) -> Result<Vec<T>>
+    where
+        F: Fn(DynProvider<Ethereum>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<T, E>>,
+        E: std::fmt::Display,
+    {
+        let mut calls = FuturesUnordered::new();
+        for (name, provider) in self.read.iter().cloned() {
+            let future = call(provider);
+            let timeout = self.request_timeout;
+            calls.push(async move {
+                let result = tokio::time::timeout(timeout, future).await;
+                (name, result)
+            });
+        }
+
+        let mut values = Vec::new();
+        let mut failures = Vec::new();
+        while let Some((name, result)) = calls.next().await {
+            match result {
+                Ok(Ok(value)) => {
+                    values.push(value);
+                    break;
+                }
+                Ok(Err(err)) => {
+                    failures.push(format!("{name}: {}", summarize_rpc_error(&err.to_string())))
+                }
+                Err(_) => failures.push(format!("{name}: timed out")),
+            }
+        }
+        if values.is_empty() {
+            return Err(BotError::Rpc(format!(
+                "{operation} failed on every healthy provider: {}",
+                failures.join("; ")
+            )));
+        }
+
+        let deadline = tokio::time::Instant::now() + settle_window;
+        loop {
+            match tokio::time::timeout_at(deadline, calls.next()).await {
+                Ok(Some((_name, Ok(Ok(value))))) => values.push(value),
+                Ok(Some((_name, _))) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+        Ok(values)
+    }
+
     pub async fn benchmark_endpoint(
         &self,
         name: &str,
@@ -452,6 +535,7 @@ impl RpcClients {
         let started = Instant::now();
         let expected_hash = keccak256(&raw);
         let mut tasks = FuturesUnordered::new();
+        let mut ambiguous = false;
         for (name, provider) in self.broadcast.iter().cloned() {
             let raw = raw.clone();
             let timeout = self.broadcast_timeout;
@@ -469,6 +553,7 @@ impl RpcClients {
                 Ok(Ok(pending)) => {
                     let hash = *pending.tx_hash();
                     if hash != expected_hash {
+                        ambiguous = true;
                         tracing::warn!(provider = %name, returned_hash = %hash, expected_hash = %expected_hash, "RPC returned a transaction hash that does not match the signed bytes");
                         continue;
                     }
@@ -486,8 +571,16 @@ impl RpcClients {
                 Ok(Err(err)) => {
                     tracing::warn!(provider = %name, error = %summarize_rpc_error(&err.to_string()), "broadcast endpoint rejected transaction");
                 }
-                Err(_) => tracing::warn!(provider = %name, "broadcast endpoint timed out"),
+                Err(_) => {
+                    ambiguous = true;
+                    tracing::warn!(provider = %name, "broadcast endpoint timed out")
+                }
             }
+        }
+        if ambiguous {
+            return Err(BotError::BroadcastOutcomeUnknown {
+                hash: expected_hash,
+            });
         }
         Err(BotError::Transaction(
             "all configured broadcast endpoints rejected the raw transaction".to_string(),

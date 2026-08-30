@@ -1,8 +1,9 @@
 use crate::{
     config::{
         GasConfig, INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE, INK_MAINNET_CHAIN_ID,
-        MintCallConfig, MintConfig, MintTrigger, NonceStrategy, ROBINHOOD_DEFAULT_GAS_LIMIT,
-        ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE, ROBINHOOD_MAINNET_CHAIN_ID,
+        MintCallConfig, MintConfig, MintTrigger, NonceStrategy, OpenSeaExecutionMode,
+        ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
+        ROBINHOOD_MAINNET_CHAIN_ID,
     },
     error::{BotError, Result},
 };
@@ -135,18 +136,23 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
                 "0.001",
             )?)
         };
-        let stage_start = ask(
-            "Earliest OpenSea stage time (Unix seconds; 0 to auto-use active/upcoming stages)",
-            "0",
-        )?
-        .parse()
-        .map_err(|err| BotError::Config(format!("invalid stage start time: {err}")))?;
+        let execution_mode = ask("OpenSea execution mode (normal/aggressive)", "normal")?;
+        let opensea_execution_mode = match execution_mode.trim().to_ascii_lowercase().as_str() {
+            "normal" => OpenSeaExecutionMode::Normal,
+            "aggressive" => OpenSeaExecutionMode::Aggressive,
+            _ => {
+                return Err(BotError::Config(
+                    "OpenSea execution mode must be `normal` or `aggressive`".to_string(),
+                ));
+            }
+        };
         let config = MintConfig {
             name,
             chain_id,
             native_currency: None,
             contract_address,
             opensea_drop_slug: Some(opensea_drop_slug),
+            opensea_execution_mode,
             require_zero_value,
             max_price_per_nft,
             quantity,
@@ -158,21 +164,37 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
                 price_per_nft: "0".to_string(),
             },
             trigger: MintTrigger::BlockTimestamp {
-                timestamp: stage_start,
+                // OpenSea mode owns stage selection. It starts with the first
+                // active/upcoming stage and advances automatically when the
+                // wallet has already used an earlier stage.
+                timestamp: 0,
             },
             gas: GasConfig {
                 gas_limit: Some(default_gas_limit),
                 max_total_gas_cost_native: Some(default_max_gas_cost_native.to_string()),
                 ..GasConfig::default()
             },
-            nonce_strategy: NonceStrategy::JustBeforeTrigger,
+            nonce_strategy: if matches!(opensea_execution_mode, OpenSeaExecutionMode::Aggressive) {
+                NonceStrategy::RefreshEachBlock
+            } else {
+                NonceStrategy::JustBeforeTrigger
+            },
             replacement: Default::default(),
             expected_start_time: None,
             confirmations: 1,
         };
         config.validate()?;
         println!(
-            "OpenSea mode: GTD/FCFS stage and price are selected by the Drops API when the stage is active."
+            "OpenSea mode: stages and price are selected automatically by the Drops API; previously used or unavailable stages are skipped."
+        );
+        println!(
+            "Execution mode: {}",
+            match opensea_execution_mode {
+                OpenSeaExecutionMode::Normal => "normal (fresh simulation and just-in-time nonce)",
+                OpenSeaExecutionMode::Aggressive => {
+                    "aggressive (configured gas limit and continuously prewarmed fee/nonce fields)"
+                }
+            }
         );
         return Ok(config);
     }
@@ -268,6 +290,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         native_currency: None,
         contract_address,
         opensea_drop_slug: None,
+        opensea_execution_mode: OpenSeaExecutionMode::Normal,
         require_zero_value: false,
         max_price_per_nft: None,
         quantity,

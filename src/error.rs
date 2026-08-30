@@ -1,4 +1,4 @@
-use alloy::primitives::Address;
+use alloy::primitives::{Address, B256};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -46,8 +46,16 @@ pub enum BotError {
     #[error("transaction error: {0}")]
     Transaction(String),
 
+    #[error(
+        "broadcast outcome is unknown for transaction {hash}; verify the transaction before rerunning"
+    )]
+    BroadcastOutcomeUnknown { hash: B256 },
+
     #[error("OpenSea API error ({status}): {message}")]
     OpenSeaApi { status: u16, message: String },
+
+    #[error("OpenSea API transport request failed")]
+    OpenSeaTransport,
 
     #[error("manual trigger control error: {0}")]
     ManualTrigger(String),

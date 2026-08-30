@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NFT Mint Bot Review — 2026-08-29</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+    body { margin: 0; background: #0d1117; color: #e6edf3; }
+    main { max-width: 920px; margin: 0 auto; padding: 40px 24px 72px; }
+    h1, h2 { letter-spacing: -0.02em; }
+    .summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+    .card, section { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 18px; }
+    section { margin-top: 18px; }
+    .score { color: #3fb950; font-size: 1.5rem; font-weight: 700; }
+    .fixed { color: #3fb950; }
+    .risk { color: #d29922; }
+    li { margin: 8px 0; line-height: 1.45; }
+    code { color: #79c0ff; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Recent upgrade review</h1>
+  <p>OpenSea normal/aggressive execution, automatic stage selection, RPC behavior, nonce safety, gas/payment guards, and secret handling.</p>
+  <div class="summary">
+    <div class="card"><div>Security</div><div class="score">A−</div></div>
+    <div class="card"><div>Code quality</div><div class="score">B+</div></div>
+    <div class="card"><div>Tests</div><div class="score">46 passed</div></div>
+    <div class="card"><div>P0 defects</div><div class="score">0</div></div>
+  </div>
+
+  <section>
+    <h2 class="fixed">Fixed</h2>
+    <ol>
+      <li>Continuously refresh aggressive-mode nonce, fee, and balance caches.</li>
+      <li>Refresh the nonce after cross-process wallet-lock contention, with locks scoped by chain ID.</li>
+      <li>Remove aggressive mode's final balance RPC while retaining payment and gas-budget guards.</li>
+      <li>Require a fixed gas limit and maximum total gas-cost cap in aggressive mode.</li>
+      <li>Remove redundant per-block RPC refreshes from normal OpenSea mode.</li>
+      <li>Retry aggressive inactive-stage responses on the next block without wall-clock skew.</li>
+      <li>Preserve the selected later mint stage when OpenSea refreshes the schedule.</li>
+      <li>Make <code>refresh_each_block</code> use its refreshed nonce.</li>
+      <li>Replace runtime OpenSea invariant panics with typed errors.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2 class="risk">Residual risks</h2>
+    <ul>
+      <li>Aggressive mode skips gas simulation. An insufficient fixed gas limit or changed on-chain state can cause a paid revert.</li>
+      <li>Transactions from another wallet application after the final nonce refresh can invalidate the cache.</li>
+      <li>OpenSea API latency, rate limits, stale stage data, and outages remain external dependencies.</li>
+      <li>No real-funds mainnet transaction was submitted during review.</li>
+      <li><code>cargo-audit</code> and <code>cargo-deny</code> were unavailable, so a registry advisory scan was not run.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Verification</h2>
+    <ul>
+      <li><code>cargo test --locked --all-targets</code>: passed</li>
+      <li><code>cargo clippy --locked --all-targets --all-features -- -D warnings</code>: passed</li>
+      <li><code>cargo build --locked --release</code>: passed</li>
+      <li><code>git diff --check</code>: passed</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

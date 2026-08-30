@@ -24,6 +24,8 @@ pub struct MintConfig {
     #[serde(default)]
     pub opensea_drop_slug: Option<String>,
     #[serde(default)]
+    pub opensea_execution_mode: OpenSeaExecutionMode,
+    #[serde(default)]
     pub require_zero_value: bool,
     #[serde(default)]
     pub max_price_per_nft: Option<String>,
@@ -40,6 +42,17 @@ pub struct MintConfig {
     pub expected_start_time: Option<u64>,
     #[serde(default = "default_confirmations")]
     pub confirmations: u64,
+}
+
+/// Controls how much OpenSea transaction preparation is performed on the
+/// mint critical path. Both modes still obtain wallet-specific calldata from
+/// OpenSea and enforce the configured payment guards.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenSeaExecutionMode {
+    #[default]
+    Normal,
+    Aggressive,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -238,6 +251,11 @@ impl MintConfig {
         if self.name.trim().is_empty() {
             return Err(BotError::Config("name must not be empty".to_string()));
         }
+        if self.name.chars().any(char::is_control) {
+            return Err(BotError::Config(
+                "name must not contain terminal control characters".to_string(),
+            ));
+        }
         if self.chain_id == 0 {
             return Err(BotError::Config(
                 "chain_id must be greater than zero".to_string(),
@@ -266,6 +284,16 @@ impl MintConfig {
                     "OpenSea mint quantity must be between 1 and 100".to_string(),
                 ));
             }
+            if matches!(
+                self.opensea_execution_mode,
+                OpenSeaExecutionMode::Aggressive
+            ) && (self.gas.gas_limit.is_none() || self.gas.max_total_gas_cost_native.is_none())
+            {
+                return Err(BotError::Config(
+                    "aggressive OpenSea mode requires gas.gas_limit and gas.max_total_gas_cost_native"
+                        .to_string(),
+                ));
+            }
             let maximum = self.maximum_opensea_mint_value_wei()?;
             if self.require_zero_value {
                 if maximum.is_some_and(|value| !value.is_zero()) {
@@ -279,6 +307,13 @@ impl MintConfig {
                     "max_price_per_nft is required for a paid OpenSea mint".to_string(),
                 ));
             }
+        }
+        if self.opensea_drop_slug.is_none()
+            && !matches!(self.opensea_execution_mode, OpenSeaExecutionMode::Normal)
+        {
+            return Err(BotError::Config(
+                "opensea_execution_mode requires opensea_drop_slug".to_string(),
+            ));
         }
         if self.quantity == 0 {
             return Err(BotError::Config(

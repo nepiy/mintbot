@@ -1,4 +1,6 @@
-use nft_mint_bot::config::{MintConfig, MintTrigger, parse_gwei, parse_native_amount};
+use nft_mint_bot::config::{
+    MintConfig, MintTrigger, OpenSeaExecutionMode, parse_gwei, parse_native_amount,
+};
 use std::fs;
 
 #[test]
@@ -85,6 +87,49 @@ fn validates_opensea_drop_slug() {
     .expect("valid JSON shape");
     assert!(config.validate().is_ok());
     config.opensea_drop_slug = Some("not/a-safe-slug".to_string());
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn aggressive_opensea_mode_requires_a_fixed_gas_limit_and_cost_cap() {
+    let mut config: MintConfig = serde_json::from_str(
+        r#"{
+          "name": "Aggressive OpenSea drop",
+          "chain_id": 4663,
+          "contract_address": "0x0000000000000000000000000000000000000001",
+          "opensea_drop_slug": "aggressive-drop",
+          "opensea_execution_mode": "aggressive",
+          "require_zero_value": true,
+          "quantity": 1,
+          "mint": { "function": "mint(uint256)" },
+          "trigger": { "type": "block_timestamp", "timestamp": 0 }
+        }"#,
+    )
+    .expect("valid JSON shape");
+    assert!(matches!(
+        config.opensea_execution_mode,
+        OpenSeaExecutionMode::Aggressive
+    ));
+    assert!(config.validate().is_err());
+    config.gas.gas_limit = Some(230_000);
+    assert!(config.validate().is_err());
+    config.gas.max_total_gas_cost_native = Some("0.001".to_string());
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn rejects_terminal_control_characters_in_collection_name() {
+    let config: MintConfig = serde_json::from_str(
+        r#"{
+          "name": "Unsafe\u001b[31m name",
+          "chain_id": 31337,
+          "contract_address": "0x0000000000000000000000000000000000000001",
+          "quantity": 1,
+          "mint": { "function": "mint(uint256)" },
+          "trigger": { "type": "manual" }
+        }"#,
+    )
+    .expect("valid JSON shape");
     assert!(config.validate().is_err());
 }
 
