@@ -360,6 +360,8 @@ For OpenSea Drops it then asks:
 
 For direct contract mode it asks for the price, optional Merkle proof, and trigger. The simple interactive direct mode calls `mint(uint256)` with the requested quantity. Use an advanced JSON configuration when the contract uses a different function or argument layout.
 
+Direct mode performs a final `eth_call` simulation when its trigger becomes ready. If the contract reports a recognizable closed, inactive, paused, or not-started condition, the bot keeps monitoring and retries on later blocks instead of broadcasting a transaction that will obviously revert. If a close/open race still causes a submitted transaction to revert, the bot checks the parent block, refreshes the nonce, and keeps monitoring. Payment, ABI, proof, limit, supply, and gas errors remain fatal so a bad configuration is not retried indefinitely. A timestamp trigger is only a clock; when the contract exposes a boolean such as `mintActive()`, prefer a boolean contract-state trigger.
+
 Review the full startup summary. Do not proceed unless all of these are correct:
 
 - Selected network and contract.
@@ -581,7 +583,8 @@ cast send <contract-address> "setPublicSale(bool)" true \
 - ABI errors: use canonical Solidity signatures and match argument types/counts.
 - OpenSea stage unavailable: the stage may not yet be active or the wallet may not be eligible; the monitor may advance to the next scheduled stage.
 - WebSocket disconnects: the monitor reconnects, revalidates the chain, restores subscriptions, and backfills missed event logs.
-- Reverted transaction: inspect the receipt and contract requirements; the bot does not bypass sale state, allowlists, signatures, or wallet limits.
+- Direct contract closed/not active: the bot logs that it is waiting and retries on the next block. If it still stops, the RPC did not expose a recognizable closed reason; use the contract's boolean state trigger and verify the exact mint call with `simulate`.
+- Reverted transaction: inspect the receipt and contract requirements; the bot does not bypass sale state, allowlists, signatures, or wallet limits. Payment, ABI, proof, limit, supply, and gas failures stop before another attempt.
 
 ### Official references
 

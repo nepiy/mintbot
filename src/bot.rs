@@ -18,7 +18,7 @@ use crate::{
 };
 use alloy::{
     consensus::BlockHeader,
-    eips::Encodable2718,
+    eips::{BlockId, Encodable2718},
     network::TransactionBuilder,
     primitives::{B256, U256},
     pubsub::SubscriptionStream,
@@ -40,6 +40,7 @@ pub struct PreparedTransaction {
     pub fee_cap: u128,
     pub available_balance: U256,
     pub opensea_hydrated: bool,
+    force_nonce_refresh: bool,
 }
 
 pub async fn run_bot(config_path: PathBuf, dry_run: bool) -> Result<()> {
@@ -176,6 +177,7 @@ async fn run_bot_with_config(
         dry_run,
         dynamic_fields_healthy: true,
         last_seen_block,
+        last_closed_retry_notice: None,
         opensea_stages,
         opensea_stage_index: 0,
         opensea_client: opensea_client.as_ref(),
@@ -356,6 +358,7 @@ pub async fn prepare_transaction(
         fee_cap,
         available_balance,
         opensea_hydrated: false,
+        force_nonce_refresh: false,
     })
 }
 
@@ -597,6 +600,7 @@ struct MonitorContext<'a> {
     dry_run: bool,
     dynamic_fields_healthy: bool,
     last_seen_block: Option<u64>,
+    last_closed_retry_notice: Option<Instant>,
     opensea_stages: Vec<OpenSeaStage>,
     opensea_stage_index: usize,
     opensea_client: Option<&'a OpenSeaClient>,
@@ -670,6 +674,11 @@ async fn monitor_until_trigger(
                 return Ok(());
             }
             Ok(MonitorOutcome::Done) => return Ok(()),
+            Ok(MonitorOutcome::Retry) => {
+                context.state.store(BotState::WaitingForTrigger);
+                context.dynamic_fields_healthy = false;
+                continue;
+            }
             Err(MonitorFailure::Execution(err)) => {
                 context.state.store(BotState::Failed);
                 return Err(err);
@@ -737,6 +746,7 @@ async fn monitor_until_trigger(
 #[derive(Debug, Clone, Copy)]
 enum MonitorOutcome {
     Done,
+    Retry,
     Shutdown,
 }
 
@@ -950,9 +960,10 @@ async fn monitor_manual(
             match ensure_transaction_ready(context).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Err(MonitorFailure::Execution(BotError::Transaction(
-                        "could not prepare transaction for manual trigger".to_string(),
-                    )));
+                    println!(
+                        "[INFO] Direct mint contract is closed; waiting for another manual trigger"
+                    );
+                    return Ok(MonitorOutcome::Retry);
                 }
                 Err(err) => return Err(MonitorFailure::Execution(err)),
             }
@@ -1132,6 +1143,30 @@ async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bo
             return Err(err);
         }
     }
+
+    // Direct contract mints can be armed before the sale opens. A timestamp
+    // or an incorrect view trigger may become ready while the contract still
+    // rejects public callers, so simulate the exact request immediately
+    // before acquiring the one-shot trigger. Known closed/paused responses
+    // stay in the monitor loop; all other simulation errors remain fatal and
+    // prevent an avoidable gas-paying transaction.
+    if context.config.opensea_drop_slug.is_none() {
+        match simulate_call(context.rpc, context.prepared.request.clone()).await {
+            Ok(()) => context.last_closed_retry_notice = None,
+            Err(error) if is_contract_closed_error(&error) => {
+                if context
+                    .last_closed_retry_notice
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+                {
+                    println!("[INFO] Direct mint contract is closed; retrying on the next block");
+                    context.last_closed_retry_notice = Some(Instant::now());
+                }
+                tracing::debug!(error = %error, "direct mint preflight is waiting for the contract to open");
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        }
+    }
     Ok(true)
 }
 
@@ -1223,6 +1258,51 @@ impl MonitorContext<'_> {
 
 fn is_opensea_stage_not_active_rejection(error: &BotError) -> bool {
     matches!(error, BotError::OpenSeaApi { status: 409, .. })
+}
+
+fn is_contract_closed_error(error: &BotError) -> bool {
+    let message = match error {
+        BotError::Rpc(message) | BotError::Transaction(message) => message,
+        _ => return false,
+    };
+    let message = message.to_ascii_lowercase();
+    [
+        "mint closed",
+        "mint is closed",
+        "mint not active",
+        "mint is not active",
+        "sale closed",
+        "sale is closed",
+        "sale not active",
+        "sale is not active",
+        "minting paused",
+        "minting is paused",
+        "contract is paused",
+        "sale is paused",
+        "mint is paused",
+        "pausable: paused",
+        "not started",
+        "deployer only",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+async fn mint_was_closed_before_receipt(
+    rpc: &RpcClients,
+    request: &TransactionRequest,
+    receipt_block: Option<u64>,
+) -> bool {
+    let Some(parent_block) = receipt_block.and_then(|block| block.checked_sub(1)) else {
+        return false;
+    };
+    match rpc
+        .call_at(request.clone(), BlockId::number(parent_block))
+        .await
+    {
+        Ok(_) => false,
+        Err(error) => is_contract_closed_error(&error),
+    }
 }
 
 fn is_advanceable_opensea_rejection(error: &BotError) -> bool {
@@ -1435,10 +1515,11 @@ async fn execute_transaction(
     metrics.finalization_started = Some(Instant::now());
     let nonce_lock = WalletNonceLock::acquire(config.chain_id, wallet.address).await?;
     let mut request = prepared.request.clone();
-    if !uses_cached_nonce(config) || nonce_lock.was_contended() {
+    if prepared.force_nonce_refresh || !uses_cached_nonce(config) || nonce_lock.was_contended() {
         // A cached nonce is no longer trustworthy after waiting for another
         // bot process using the same wallet to release its cross-process lock.
         request.set_nonce(rpc.preload_nonce(wallet.address).await?);
+        prepared.force_nonce_refresh = false;
     }
     metrics.finalization_completed = Some(Instant::now());
     state.store(BotState::Signing);
@@ -1465,9 +1546,15 @@ async fn execute_transaction(
         rpc_elapsed.as_secs_f64() * 1000.0
     );
     println!("Waiting for receipt...");
-    monitor_receipt(config, rpc, wallet, request, hash, state).await?;
+    let outcome = monitor_receipt(config, rpc, wallet, request, hash, state).await?;
+    if matches!(outcome, MonitorOutcome::Retry) {
+        // A mined/reverted attempt has consumed its nonce even though it did
+        // not mint. Force the next attempt to fetch a fresh pending nonce;
+        // this matters for the preloaded strategy used by the wizard.
+        prepared.force_nonce_refresh = true;
+    }
     metrics.print();
-    Ok(MonitorOutcome::Done)
+    Ok(outcome)
 }
 
 async fn monitor_receipt(
@@ -1477,7 +1564,7 @@ async fn monitor_receipt(
     mut request: TransactionRequest,
     mut hash: B256,
     state: &AtomicBotState,
-) -> Result<()> {
+) -> Result<MonitorOutcome> {
     let mut candidate_hashes = vec![hash];
     let mut last_replacement_block = rpc.block_number().await.ok();
     let mut replacements = 0_u32;
@@ -1488,7 +1575,7 @@ async fn monitor_receipt(
                 state.store(BotState::Stopped);
                 println!("\nTransaction already submitted: {hash}");
                 println!("Receipt monitoring stopped.");
-                return Ok(());
+                return Ok(MonitorOutcome::Shutdown);
             }
             _ = tokio::time::sleep(Duration::from_millis(500)) => {}
         }
@@ -1525,7 +1612,7 @@ async fn monitor_receipt(
                             state.store(BotState::Stopped);
                             println!("\nTransaction already submitted: {hash}");
                             println!("Receipt monitoring stopped.");
-                            return Ok(());
+                            return Ok(MonitorOutcome::Shutdown);
                         }
                         _ = tokio::time::sleep(Duration::from_millis(500)) => {}
                     }
@@ -1558,14 +1645,20 @@ async fn monitor_receipt(
                 "Total transaction fee: {} wei",
                 u128::from(receipt.gas_used) * receipt.effective_gas_price
             );
-            state.store(if receipt.status() {
-                BotState::Confirmed
-            } else {
-                BotState::Failed
-            });
             if receipt.status() {
-                return Ok(());
+                state.store(BotState::Confirmed);
+                return Ok(MonitorOutcome::Done);
             }
+            if config.opensea_drop_slug.is_none()
+                && mint_was_closed_before_receipt(rpc, &request, receipt.block_number).await
+            {
+                state.store(BotState::WaitingForTrigger);
+                println!(
+                    "[WARN] Direct mint reverted while the contract was closed; retrying on the next block"
+                );
+                return Ok(MonitorOutcome::Retry);
+            }
+            state.store(BotState::Failed);
             return Err(BotError::Transaction(format!(
                 "mint transaction {mined_hash} reverted"
             )));
@@ -1819,7 +1912,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::{
         automatic_opensea_retry_timestamp, ensure_opensea_supply, is_advanceable_opensea_rejection,
-        is_aggressive_opensea, is_ambiguous_opensea_precondition,
+        is_aggressive_opensea, is_ambiguous_opensea_precondition, is_contract_closed_error,
         is_opensea_stage_not_active_rejection, next_opensea_stage, next_opensea_stage_has_started,
         refreshed_stage_index, select_opensea_gas_limit, uses_cached_nonce,
         validate_opensea_mint_value, validate_transaction_budget_with_balance,
@@ -1882,6 +1975,23 @@ mod tests {
     fn zero_delay_opensea_retry_is_ready_on_the_next_block() {
         assert_eq!(automatic_opensea_retry_timestamp(0), 0);
         assert!(automatic_opensea_retry_timestamp(2) >= 2);
+    }
+
+    #[test]
+    fn recognizes_closed_direct_mint_reverts_but_not_payment_failures() {
+        assert!(is_contract_closed_error(&BotError::Transaction(
+            "eth_call simulation failed: execution reverted: Mint closed; deployer only"
+                .to_string(),
+        )));
+        assert!(is_contract_closed_error(&BotError::Rpc(
+            "execution reverted: sale is not active".to_string(),
+        )));
+        assert!(is_contract_closed_error(&BotError::Transaction(
+            "execution reverted: Pausable: paused".to_string(),
+        )));
+        assert!(!is_contract_closed_error(&BotError::Transaction(
+            "execution reverted: Insufficient ETH".to_string(),
+        )));
     }
 
     #[test]
