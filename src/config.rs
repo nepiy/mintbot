@@ -1,5 +1,11 @@
-use crate::error::{BotError, Result};
-use alloy::primitives::{Address, U256};
+use crate::{
+    error::{BotError, Result},
+    security::validate_direct_mint_function,
+};
+use alloy::{
+    json_abi::Function,
+    primitives::{Address, B256, U256},
+};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, OpenOptions},
@@ -15,12 +21,15 @@ pub const INK_DEFAULT_GAS_LIMIT: u64 = 230_000;
 pub const INK_DEFAULT_MAX_GAS_COST_NATIVE: &str = "0.001";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MintConfig {
     pub name: String,
     pub chain_id: u64,
     #[serde(default)]
     pub native_currency: Option<String>,
     pub contract_address: String,
+    #[serde(default)]
+    pub expected_contract_code_hash: Option<String>,
     #[serde(default)]
     pub opensea_drop_slug: Option<String>,
     #[serde(default)]
@@ -56,6 +65,7 @@ pub enum OpenSeaExecutionMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MintCallConfig {
     pub function: String,
     #[serde(default)]
@@ -67,7 +77,7 @@ pub struct MintCallConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum MintTrigger {
     BlockTimestamp {
         timestamp: u64,
@@ -99,6 +109,7 @@ pub enum GasMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GasConfig {
     #[serde(default)]
     pub mode: GasMode,
@@ -135,6 +146,7 @@ pub enum NonceStrategy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplacementConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -222,6 +234,27 @@ impl MintConfig {
             })
     }
 
+    pub fn expected_contract_code_hash_value(&self) -> Result<Option<B256>> {
+        self.expected_contract_code_hash
+            .as_deref()
+            .map(|value| {
+                if value.len() != 66
+                    || !value.starts_with("0x")
+                    || !value[2..].chars().all(|character| character.is_ascii_hexdigit())
+                {
+                    return Err(BotError::Config(format!(
+                        "expected_contract_code_hash must be a 0x-prefixed 32-byte hash, got `{value}`"
+                    )));
+                }
+                value
+                    .parse::<B256>()
+                    .map_err(|_| BotError::Config(format!(
+                        "expected_contract_code_hash must be a 0x-prefixed 32-byte hash, got `{value}`"
+                    )))
+            })
+            .transpose()
+    }
+
     pub fn mint_value_wei(&self) -> Result<U256> {
         parse_native_amount(&self.mint.price_per_nft)?
             .checked_mul(U256::from(self.quantity))
@@ -262,6 +295,7 @@ impl MintConfig {
             ));
         }
         let _ = self.contract()?;
+        let _ = self.expected_contract_code_hash_value()?;
         if let Some(slug) = self.opensea_drop_slug.as_deref() {
             let slug = slug.trim();
             if slug.is_empty()
@@ -329,6 +363,11 @@ impl MintConfig {
             return Err(BotError::Config(
                 "mint.function must be a Solidity signature such as mint(uint256)".to_string(),
             ));
+        }
+        let mint_function = Function::parse(&self.mint.function)
+            .map_err(|error| BotError::Abi(format!("{}: {error}", self.mint.function)))?;
+        if self.opensea_drop_slug.is_none() {
+            validate_direct_mint_function(&mint_function)?;
         }
         let _ = parse_native_amount(&self.mint.price_per_nft)?;
         if !(self.gas.multiplier.is_finite() && self.gas.multiplier >= 1.0) {

@@ -218,7 +218,7 @@ impl RpcClients {
         self.broadcast = Arc::new(broadcast);
     }
 
-    pub async fn validate_contract(&self, config: &MintConfig) -> Result<()> {
+    pub async fn validate_contract(&self, config: &MintConfig) -> Result<B256> {
         let contract = config.contract()?;
         let codes = self
             .read_all("eth_getCode", move |provider| async move {
@@ -244,7 +244,14 @@ impl RpcClients {
                 "RPC providers returned different bytecode for the configured contract".to_string(),
             ));
         }
-        Ok(())
+        if let Some(pinned_hash) = config.expected_contract_code_hash_value()?
+            && expected_hash != pinned_hash
+        {
+            return Err(BotError::Config(format!(
+                "contract bytecode hash mismatch: configured {pinned_hash}, RPC returned {expected_hash}"
+            )));
+        }
+        Ok(expected_hash)
     }
 
     pub async fn subscribe_blocks(&self) -> Result<SubscriptionStream<Header>> {

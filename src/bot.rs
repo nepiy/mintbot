@@ -1,5 +1,5 @@
 use crate::{
-    abi::encode_mint,
+    abi::{encode_mint, parse_function},
     config::{
         GasMode, MintConfig, MintTrigger, NonceStrategy, OpenSeaExecutionMode, parse_gwei,
         parse_native_amount,
@@ -11,6 +11,7 @@ use crate::{
         validate_seadrop_calldata,
     },
     rpc::{RpcClients, simulate_call},
+    security::validate_direct_mint_function,
     setup::{bind_manual_control, cleanup_manual_control, prompt_interactive_config},
     state::{AtomicBotState, BotState},
     trigger::{TriggerEngine, TriggerObservation},
@@ -20,7 +21,7 @@ use alloy::{
     consensus::BlockHeader,
     eips::{BlockId, Encodable2718},
     network::TransactionBuilder,
-    primitives::{B256, U256},
+    primitives::{Address, B256, TxKind, U256},
     pubsub::SubscriptionStream,
     rpc::types::{Filter, Header, Log, TransactionRequest},
 };
@@ -79,8 +80,9 @@ async fn run_bot_with_config(
 
     state.store(BotState::Validating);
     rpc.validate_chain(&config).await?;
-    rpc.validate_contract(&config).await?;
+    let contract_code_hash = rpc.validate_contract(&config).await?;
     println!("Contract: VALID");
+    println!("Contract code hash: {contract_code_hash}");
 
     state.store(BotState::Preparing);
     let mut prepared = prepare_transaction(&config, &rpc, &wallet).await?;
@@ -200,7 +202,7 @@ pub async fn run_simulation(config_path: PathBuf) -> Result<()> {
     let wallet = LoadedWallet::from_env()?;
     let mut rpc = RpcClients::connect_from_env_for_chain(config.chain_id).await?;
     rpc.validate_chain(&config).await?;
-    rpc.validate_contract(&config).await?;
+    let contract_code_hash = rpc.validate_contract(&config).await?;
     let mut prepared = prepare_transaction(&config, &rpc, &wallet).await?;
     if config.opensea_drop_slug.is_some() {
         hydrate_opensea_transaction(&config, &rpc, &wallet, &mut prepared).await?;
@@ -211,6 +213,7 @@ pub async fn run_simulation(config_path: PathBuf) -> Result<()> {
     println!("Chain ID: {}", config.chain_id);
     println!("Wallet: {}", short_address(wallet.address));
     println!("Contract: {}", config.contract_address);
+    println!("Contract code hash: {contract_code_hash}");
     println!("Quantity: {}", config.quantity);
     println!("Mint value: {} wei", prepared.mint_value);
     println!(
@@ -1512,6 +1515,13 @@ async fn execute_transaction(
         hydrate_opensea_transaction(config, rpc, wallet, prepared).await?;
     }
 
+    // A configured bytecode pin is intentionally rechecked on the critical
+    // path. Without this final read, a target could change after startup but
+    // before the bot signs.
+    if config.expected_contract_code_hash.is_some() {
+        rpc.validate_contract(config).await?;
+    }
+
     metrics.finalization_started = Some(Instant::now());
     let nonce_lock = WalletNonceLock::acquire(config.chain_id, wallet.address).await?;
     let mut request = prepared.request.clone();
@@ -1522,6 +1532,7 @@ async fn execute_transaction(
         prepared.force_nonce_refresh = false;
     }
     metrics.finalization_completed = Some(Instant::now());
+    validate_signing_request(config, wallet.address, prepared, &request)?;
     state.store(BotState::Signing);
     metrics.signing_started = Some(Instant::now());
     let signed = wallet.sign_request(request.clone()).await?;
@@ -1546,7 +1557,7 @@ async fn execute_transaction(
         rpc_elapsed.as_secs_f64() * 1000.0
     );
     println!("Waiting for receipt...");
-    let outcome = monitor_receipt(config, rpc, wallet, request, hash, state).await?;
+    let outcome = monitor_receipt(config, rpc, wallet, prepared, request, hash, state).await?;
     if matches!(outcome, MonitorOutcome::Retry) {
         // A mined/reverted attempt has consumed its nonce even though it did
         // not mint. Force the next attempt to fetch a fresh pending nonce;
@@ -1561,6 +1572,7 @@ async fn monitor_receipt(
     config: &MintConfig,
     rpc: &RpcClients,
     wallet: &LoadedWallet,
+    prepared: &PreparedTransaction,
     mut request: TransactionRequest,
     mut hash: B256,
     state: &AtomicBotState,
@@ -1692,6 +1704,13 @@ async fn monitor_receipt(
                     );
                     replacements = config.replacement.max_attempts;
                 } else {
+                    if let Err(err) =
+                        validate_signing_request(config, wallet.address, prepared, &replacement)
+                    {
+                        tracing::error!(error = %err, "replacement blocked by signing policy; original receipt monitoring continues");
+                        replacements = config.replacement.max_attempts;
+                        continue;
+                    }
                     let signed = match wallet.sign_request(replacement.clone()).await {
                         Ok(signed) => signed,
                         Err(err) => {
@@ -1718,6 +1737,111 @@ async fn monitor_receipt(
             }
         }
     }
+}
+
+fn validate_signing_request(
+    config: &MintConfig,
+    signer: Address,
+    prepared: &PreparedTransaction,
+    request: &TransactionRequest,
+) -> Result<()> {
+    if request.from != Some(signer) {
+        return Err(signing_policy_error("transaction sender changed"));
+    }
+    if request.chain_id != Some(config.chain_id) {
+        return Err(signing_policy_error("transaction chain ID changed"));
+    }
+
+    let expected_target = if config.opensea_drop_slug.is_some() {
+        OPENSEA_SEADROP_ADDRESS
+    } else {
+        config.contract()?
+    };
+    if request.to != Some(TxKind::Call(expected_target)) {
+        return Err(signing_policy_error(
+            "transaction target is not the configured mint contract",
+        ));
+    }
+    if request.value.unwrap_or_default() != prepared.mint_value {
+        return Err(signing_policy_error("transaction payment value changed"));
+    }
+    if request.gas != Some(prepared.gas_limit) {
+        return Err(signing_policy_error("transaction gas limit changed"));
+    }
+    if request.nonce.is_none() {
+        return Err(signing_policy_error("transaction nonce is missing"));
+    }
+    if request.gas_price.is_some() && request.max_fee_per_gas.is_some() {
+        return Err(signing_policy_error(
+            "transaction mixes legacy and EIP-1559 fee fields",
+        ));
+    }
+    let fee_cap = request
+        .gas_price
+        .or(request.max_fee_per_gas)
+        .ok_or_else(|| signing_policy_error("transaction fee cap is missing"))?;
+    validate_transaction_budget_with_balance(
+        config,
+        prepared.available_balance,
+        prepared.mint_value,
+        prepared.gas_limit,
+        fee_cap,
+    )?;
+
+    if request.max_fee_per_blob_gas.is_some()
+        || request.blob_versioned_hashes.is_some()
+        || request.sidecar.is_some()
+        || request.authorization_list.is_some()
+        || request.access_list.is_some()
+        || request.transaction_type.is_some()
+    {
+        return Err(signing_policy_error(
+            "unexpected access-list, blob, transaction-type, or account-authorization fields are present",
+        ));
+    }
+
+    let calldata = match (&request.input.input, &request.input.data) {
+        (Some(input), Some(data)) if input != data => {
+            return Err(signing_policy_error(
+                "transaction input and data fields disagree",
+            ));
+        }
+        (Some(input), _) => input.as_ref(),
+        (_, Some(data)) => data.as_ref(),
+        (None, None) => &[],
+    };
+    if calldata != prepared.calldata.as_slice() {
+        return Err(signing_policy_error("transaction calldata changed"));
+    }
+
+    if config.opensea_drop_slug.is_some() {
+        validate_opensea_mint_value(config, prepared.mint_value)?;
+        validate_seadrop_calldata(
+            calldata,
+            config.contract()?,
+            signer,
+            config.quantity,
+            prepared.mint_value,
+        )?;
+    } else {
+        if prepared.mint_value != config.mint_value_wei()? {
+            return Err(signing_policy_error(
+                "direct mint value no longer matches the configuration",
+            ));
+        }
+        let function = parse_function(&config.mint.function)?;
+        validate_direct_mint_function(&function)?;
+        if calldata.get(..4) != Some(function.selector().as_slice()) {
+            return Err(signing_policy_error(
+                "direct mint selector does not match the configured function",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn signing_policy_error(reason: &str) -> BotError {
+    BotError::Transaction(format!("signing policy refused transaction: {reason}"))
 }
 
 fn bump_fees(request: &mut TransactionRequest, multiplier: f64) -> Result<bool> {
@@ -1836,6 +1960,16 @@ fn print_armed(
         }
     } else {
         println!("Mint value: {} wei", prepared.mint_value);
+        if let Ok(function) = parse_function(&config.mint.function) {
+            println!(
+                "Direct call: {} (selector {})",
+                function.signature(),
+                function.selector()
+            );
+        }
+        println!(
+            "Signing policy: exact contract/calldata/value; asset-moving and executor selectors blocked"
+        );
     }
     println!("Wallet: {}", short_address(wallet.address));
     println!("Gas limit: {}", prepared.gas_limit);
@@ -1911,16 +2045,22 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::{
-        automatic_opensea_retry_timestamp, ensure_opensea_supply, is_advanceable_opensea_rejection,
-        is_aggressive_opensea, is_ambiguous_opensea_precondition, is_contract_closed_error,
-        is_opensea_stage_not_active_rejection, next_opensea_stage, next_opensea_stage_has_started,
-        refreshed_stage_index, select_opensea_gas_limit, uses_cached_nonce,
-        validate_opensea_mint_value, validate_transaction_budget_with_balance,
+        PreparedTransaction, automatic_opensea_retry_timestamp, ensure_opensea_supply,
+        is_advanceable_opensea_rejection, is_aggressive_opensea, is_ambiguous_opensea_precondition,
+        is_contract_closed_error, is_opensea_stage_not_active_rejection, next_opensea_stage,
+        next_opensea_stage_has_started, refreshed_stage_index, select_opensea_gas_limit,
+        uses_cached_nonce, validate_opensea_mint_value, validate_signing_request,
+        validate_transaction_budget_with_balance,
     };
+    use crate::abi::encode_mint;
     use crate::config::{MintConfig, OpenSeaExecutionMode};
     use crate::error::BotError;
     use crate::opensea::{OpenSeaDrop, OpenSeaStage};
-    use alloy::primitives::U256;
+    use alloy::{
+        network::TransactionBuilder,
+        primitives::{Address, TxKind, U256},
+        rpc::types::TransactionRequest,
+    };
 
     fn opensea_config(require_zero_value: bool, maximum: Option<&str>) -> MintConfig {
         serde_json::from_value(serde_json::json!({
@@ -1935,6 +2075,74 @@ mod tests {
             "trigger": { "type": "block_timestamp", "timestamp": 0 }
         }))
         .expect("valid test config")
+    }
+
+    fn direct_config() -> MintConfig {
+        serde_json::from_value(serde_json::json!({
+            "name": "Direct signing policy test",
+            "chain_id": 31337,
+            "contract_address": "0x0000000000000000000000000000000000000001",
+            "quantity": 2,
+            "mint": {
+                "function": "mint(uint256)",
+                "arguments": ["$quantity"],
+                "price_per_nft": "0"
+            },
+            "trigger": { "type": "manual" },
+            "gas": {
+                "max_total_gas_cost_native": "0.001"
+            }
+        }))
+        .expect("valid direct config")
+    }
+
+    #[test]
+    fn final_signing_policy_binds_direct_target_calldata_and_value() {
+        let config = direct_config();
+        let signer: Address = "0x0000000000000000000000000000000000000002"
+            .parse()
+            .expect("valid signer");
+        let calldata = encode_mint(&config.mint, config.quantity, signer, None)
+            .expect("valid calldata")
+            .bytes;
+        let mut request = TransactionRequest::default()
+            .with_from(signer)
+            .with_to(config.contract().expect("valid contract"))
+            .with_chain_id(config.chain_id)
+            .with_input(calldata.clone())
+            .with_value(U256::ZERO)
+            .with_gas_limit(100_000)
+            .with_max_fee_per_gas(1);
+        request.set_nonce(7);
+        let prepared = PreparedTransaction {
+            request: request.clone(),
+            calldata,
+            mint_value: U256::ZERO,
+            gas_limit: 100_000,
+            fee_cap: 1,
+            available_balance: U256::from(1_000_000_000_000_000u64),
+            opensea_hydrated: false,
+            force_nonce_refresh: false,
+        };
+
+        validate_signing_request(&config, signer, &prepared, &request)
+            .expect("exact prepared request should pass");
+
+        let mut wrong_target = request.clone();
+        wrong_target.to = Some(TxKind::Call(Address::ZERO));
+        assert!(validate_signing_request(&config, signer, &prepared, &wrong_target).is_err());
+
+        let mut wrong_value = request.clone();
+        wrong_value.value = Some(U256::from(1));
+        assert!(validate_signing_request(&config, signer, &prepared, &wrong_value).is_err());
+
+        let mut wrong_calldata = request;
+        wrong_calldata.input.input = Some(vec![0xde, 0xad, 0xbe, 0xef].into());
+        assert!(validate_signing_request(&config, signer, &prepared, &wrong_calldata).is_err());
+
+        let mut unexpected_type = prepared.request.clone();
+        unexpected_type.transaction_type = Some(2);
+        assert!(validate_signing_request(&config, signer, &prepared, &unexpected_type).is_err());
     }
 
     #[test]

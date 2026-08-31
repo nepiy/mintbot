@@ -134,6 +134,60 @@ fn rejects_terminal_control_characters_in_collection_name() {
 }
 
 #[test]
+fn rejects_asset_movement_in_direct_mode() {
+    let config: MintConfig = serde_json::from_str(
+        r#"{
+          "name": "Not a mint",
+          "chain_id": 1,
+          "contract_address": "0x0000000000000000000000000000000000000001",
+          "quantity": 1,
+          "mint": {
+            "function": "setApprovalForAll(address,bool)",
+            "arguments": ["0x0000000000000000000000000000000000000002", "true"]
+          },
+          "trigger": { "type": "manual" }
+        }"#,
+    )
+    .expect("valid JSON shape");
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn validates_optional_contract_code_hash_format() {
+    let mut config: MintConfig = serde_json::from_str(
+        r#"{
+          "name": "Pinned contract",
+          "chain_id": 1,
+          "contract_address": "0x0000000000000000000000000000000000000001",
+          "expected_contract_code_hash": "0x1111111111111111111111111111111111111111111111111111111111111111",
+          "quantity": 1,
+          "mint": { "function": "mint(uint256)", "arguments": ["$quantity"] },
+          "trigger": { "type": "manual" }
+        }"#,
+    )
+    .expect("valid JSON shape");
+    assert!(config.validate().is_ok());
+    config.expected_contract_code_hash = Some("1111".to_string());
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn rejects_unknown_fields_instead_of_ignoring_misspelled_safety_settings() {
+    let parsed = serde_json::from_str::<MintConfig>(
+        r#"{
+          "name": "Misspelled cap",
+          "chain_id": 1,
+          "contract_address": "0x0000000000000000000000000000000000000001",
+          "quantity": 1,
+          "mint": { "function": "mint(uint256)", "arguments": ["$quantity"] },
+          "trigger": { "type": "manual" },
+          "gas": { "max_total_gas_cost_nativ": "0.001" }
+        }"#,
+    );
+    assert!(parsed.is_err());
+}
+
+#[test]
 fn paid_opensea_mints_require_an_explicit_price_cap() {
     let mut config: MintConfig = serde_json::from_str(
         r#"{

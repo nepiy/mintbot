@@ -3,6 +3,7 @@
   "chain_id": 31337,
   "native_currency": "ETH",
   "contract_address": "0x0000000000000000000000000000000000000000",
+  "expected_contract_code_hash": null,
   "quantity": 1,
   "mint": {
     "function": "mint(uint256)",

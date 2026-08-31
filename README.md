@@ -28,6 +28,12 @@ In OpenSea mode, the contract you enter is the NFT collection contract. The bot 
 - Free-mint mode refuses any nonzero payment.
 - Applies a maximum total gas-cost cap before arming and before submission.
 - Serializes just-in-time nonce selection across local bot processes.
+- Blocks direct-mode approval, permit, transfer, swap, withdrawal, and generic executor selectors.
+- Revalidates the exact sender, chain, target, calldata, payment, gas, nonce, and transaction type immediately before every initial or replacement signature.
+- Supports an optional collection bytecode-hash pin and rechecks it immediately before signing.
+- Rejects unknown JSON fields so a misspelled price, gas, or bytecode-hash guard cannot be silently ignored.
+
+These protections prevent the bot from quietly turning a mint configuration into an approval, transfer, or arbitrary executor transaction. They cannot prove that a contract's internal `mint` implementation is honest, remove approvals already granted by the wallet, protect a key stolen from the computer, or protect against a compromised executable or dependency. Always use a fresh dedicated wallet with no token/NFT approvals and only the funds needed for the mint. The signing policy is a safety boundary, not a guarantee that any NFT contract is trustworthy.
 
 ### Low-latency execution
 
@@ -205,7 +211,7 @@ Use the release executable for real mints. `cargo run --release` is also support
 
 ### Step 5 — Prepare a dedicated wallet
 
-Create a new EVM wallet specifically for the bot. Export only that wallet’s private key; never enter a seed phrase into this project.
+Create a new EVM wallet specifically for the bot. Export only that wallet’s private key; never enter a seed phrase into this project. Do not reuse a wallet that has ERC-20 allowances, NFT operator approvals, valuable NFTs, or unrelated funds. A malicious mint contract can attempt to use approvals that existed before this bot started, and the bot cannot discover every approval across every token contract from a standard RPC endpoint.
 
 The `PRIVATE_KEY` value must be the wallet’s 32-byte hexadecimal private key, normally written as `0x` followed by 64 hexadecimal characters. The bot derives and displays a shortened wallet address from this key during startup.
 
@@ -370,6 +376,8 @@ Review the full startup summary. Do not proceed unless all of these are correct:
 - Free-mint or maximum-price guard.
 - Gas limit and maximum gas-cost cap.
 - Trigger or OpenSea stage schedule.
+- In direct mode, the exact Solidity function signature and four-byte selector.
+- The collection contract code hash.
 
 If anything is wrong, press Ctrl+C and restart with the correct values. Dry-run mode prints `Mode: DRY-RUN`. When its trigger fires, it stops before signing or broadcasting.
 
@@ -452,6 +460,7 @@ Start with [`configs/example.json`](configs/example.json). One configuration fil
   "chain_id": 8453,
   "native_currency": "ETH",
   "contract_address": "0x...",
+  "expected_contract_code_hash": null,
   "quantity": 1,
   "mint": {
     "function": "mint(address,uint256)",
@@ -482,6 +491,17 @@ Start with [`configs/example.json`](configs/example.json). One configuration fil
 ```
 
 Supported argument placeholders are `$wallet`, `$quantity`, and `$proof`. Common dynamic calls include `mint(uint256)`, `publicMint(uint256)`, `mint(address,uint256)`, and `mint(uint256,bytes32[])`.
+
+Direct-mode signing rejects approval, permit, asset-transfer, swap, withdrawal, and generic executor function names/selectors. It then binds the signature to the exact configured contract, calldata, payment value, chain ID, sender, gas limit, and nonce. The same checks run again for fee-bumped replacement transactions.
+
+`expected_contract_code_hash` is optional. To use it:
+
+1. Run `simulate --config ...` or a dry run and copy the printed `Contract code hash`.
+2. Verify that hash through a separate trusted RPC or block explorer.
+3. Put the complete `0x`-prefixed 32-byte hash in the JSON field.
+4. Run `simulate` again. The bot will refuse to arm if the live code differs, and it checks the pin again immediately before a real signature.
+
+Omit the field instead of using the placeholder. A bytecode pin detects changes to the code stored at the collection address, but it does not detect an upgrade behind a proxy whose outer proxy bytecode stays unchanged. Verify proxy implementations separately before funding the wallet.
 
 ## 4. Command and runtime reference
 
@@ -581,6 +601,8 @@ cast send <contract-address> "setPublicSale(bool)" true \
 - `has no deployed bytecode`: check the contract address and selected network.
 - `insufficient balance`: fund the dedicated wallet for mint value plus the configured gas ceiling.
 - ABI errors: use canonical Solidity signatures and match argument types/counts.
+- `direct mint function ... is blocked by the signing policy`: the configured function can approve, move, or generically execute assets and is intentionally unsupported by this mint-only bot.
+- `contract bytecode hash mismatch`: recheck the address, network, proxy state, and verified code. Never replace the expected hash merely to silence the error.
 - OpenSea stage unavailable: the stage may not yet be active or the wallet may not be eligible; the monitor may advance to the next scheduled stage.
 - WebSocket disconnects: the monitor reconnects, revalidates the chain, restores subscriptions, and backfills missed event logs.
 - Direct contract closed/not active: the bot logs that it is waiting and retries on the next block. If it still stops, the RPC did not expose a recognizable closed reason; use the contract's boolean state trigger and verify the exact mint call with `simulate`.
@@ -595,3 +617,5 @@ cast send <contract-address> "setPublicSale(bool)" true \
 - [Alloy RPC providers](https://alloy.rs/rpc-providers/introduction/)
 - [Alloy static and dynamic ABI](https://alloy.rs/guides/static-dynamic-abi-in-alloy/)
 - [Tokio Ctrl+C handling](https://docs.rs/tokio/latest/tokio/signal/fn.ctrl_c.html)
+- [Ethereum.org smart-contract security](https://ethereum.org/developers/docs/smart-contracts/security/)
+- [Ethereum.org guide to revoking token access](https://ethereum.org/guides/how-to-revoke-token-access/)

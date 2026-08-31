@@ -1,8 +1,74 @@
 use crate::error::{BotError, Result};
+use alloy::{json_abi::Function, primitives::keccak256};
 use std::path::Path;
 
 const REDACTED_URL: &str = "[redacted URL]";
 const REDACTED_ADDRESS: &str = "[redacted address]";
+
+// A direct-mode mint must never become a generic wallet transaction builder.
+// Check both names and selectors: selector checks also catch a deliberately
+// misleading function name that collides with a standard asset-moving call.
+const BLOCKED_DIRECT_SIGNATURES: &[&str] = &[
+    "approve(address,uint256)",
+    "setApprovalForAll(address,bool)",
+    "transfer(address,uint256)",
+    "transferFrom(address,address,uint256)",
+    "safeTransferFrom(address,address,uint256)",
+    "safeTransferFrom(address,address,uint256,bytes)",
+    "safeTransferFrom(address,address,uint256,uint256,bytes)",
+    "safeBatchTransferFrom(address,address,uint256[],uint256[],bytes)",
+    "increaseAllowance(address,uint256)",
+    "decreaseAllowance(address,uint256)",
+    "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+    "permit(address,address,uint256,uint256,bool,uint8,bytes32,bytes32)",
+];
+
+const BLOCKED_DIRECT_NAMES: &[&str] = &[
+    "approve",
+    "setapprovalforall",
+    "transfer",
+    "transferfrom",
+    "safetransferfrom",
+    "safebatchtransferfrom",
+    "increaseallowance",
+    "decreaseallowance",
+    "execute",
+    "executebatch",
+    "multicall",
+    "aggregate",
+    "aggregate3",
+    "tryaggregate",
+    "batch",
+    "call",
+    "delegatecall",
+];
+
+pub fn validate_direct_mint_function(function: &Function) -> Result<()> {
+    let name = function.name.to_ascii_lowercase();
+    let blocked_name = BLOCKED_DIRECT_NAMES.contains(&name.as_str())
+        || name.contains("permit")
+        || name.contains("approval")
+        || name.contains("transfer")
+        || name.contains("execute")
+        || name.contains("multicall")
+        || name.contains("delegatecall")
+        || name.contains("withdraw")
+        || name.contains("sweep")
+        || name.contains("swap");
+    let selector = function.selector();
+    let blocked_selector = BLOCKED_DIRECT_SIGNATURES.iter().any(|signature| {
+        let digest = keccak256(signature.as_bytes());
+        selector.as_slice() == &digest[..4]
+    });
+
+    if blocked_name || blocked_selector {
+        return Err(BotError::Config(format!(
+            "direct mint function `{}` is blocked by the signing policy because it can approve, move, or generically execute assets",
+            function.signature()
+        )));
+    }
+    Ok(())
+}
 
 pub fn verify_dotenv_permissions(path: &Path) -> Result<()> {
     let metadata = match std::fs::metadata(path) {
@@ -118,7 +184,41 @@ fn looks_like_address(characters: &[char], index: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_external_text, summarize_rpc_error};
+    use super::{sanitize_external_text, summarize_rpc_error, validate_direct_mint_function};
+    use alloy::json_abi::Function;
+
+    #[test]
+    fn direct_signing_policy_blocks_asset_movement_and_generic_execution() {
+        for signature in [
+            "approve(address,uint256)",
+            "setApprovalForAll(address,bool)",
+            "safeTransferFrom(address,address,uint256)",
+            "permit(address,address,uint256,uint256,uint8,bytes32,bytes32)",
+            "execute(address,uint256,bytes)",
+            "multicall(bytes[])",
+            "mintWithPermit(uint256,bytes)",
+        ] {
+            let function = Function::parse(signature).expect("valid test signature");
+            assert!(
+                validate_direct_mint_function(&function).is_err(),
+                "{signature} should be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_signing_policy_keeps_custom_mint_and_claim_calls() {
+        for signature in [
+            "mint(uint256)",
+            "publicMint(address,uint256)",
+            "claim(uint256,bytes32[])",
+            "purchase(uint256)",
+        ] {
+            let function = Function::parse(signature).expect("valid test signature");
+            validate_direct_mint_function(&function)
+                .unwrap_or_else(|error| panic!("{signature} should be allowed: {error}"));
+        }
+    }
 
     #[test]
     fn redacts_urls_addresses_and_terminal_controls() {
