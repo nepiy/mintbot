@@ -337,9 +337,22 @@ The RPC benchmark tests the generic `HTTP_RPC_URL` and `WS_RPC_URL` pair:
 
 If you use only a network-specific profile, the interactive startup in Step 10 validates that profile instead. It checks chain IDs, deployed contract bytecode, wallet balance, WebSocket subscriptions, and every usable broadcast endpoint before printing `BOT ARMED`.
 
-### Step 10 — Run the interactive setup safely
+### Step 10 — Configure one mint path and make it `BOT ARMED`
 
-Start with dry-run mode so the bot follows the real trigger path without signing or broadcasting:
+There are two different mint paths. Choose exactly one: OpenSea Drops mode or direct contract mode. Both paths validate the chain, RPC providers, deployed bytecode, wallet balance, gas budget, and subscriptions before printing `BOT ARMED`.
+
+#### Path A — OpenSea Drops mode
+
+Use this path when the collection is an OpenSea Drop and the wallet must be checked against OpenSea’s live stages and eligibility.
+
+Before starting, confirm that:
+
+1. `OPENSEA_API_KEY` is filled in `.env`.
+2. You have the drop slug from the OpenSea collection URL. Enter the slug, not the display name or contract address.
+3. The collection contract address and chain in the wizard are correct.
+4. The dedicated wallet is eligible, funded, and has not already consumed the intended stage limit.
+
+Start a non-broadcasting verification run:
 
 ```bash
 ./target/release/nft-mint-bot start --dry-run
@@ -351,39 +364,81 @@ Windows PowerShell:
 .\target\release\nft-mint-bot.exe start --dry-run
 ```
 
-The wizard asks for these values in order:
+Answer the prompts in this order:
 
 1. Network: `1` for Robinhood Chain mainnet or `2` for Ink mainnet.
-2. NFT collection contract address on that network.
-3. OpenSea drop slug, or direct contract mode. If `OPENSEA_API_KEY` is filled, type `direct`; if it is empty, press Enter.
-4. Mint quantity.
+2. Collection contract address.
+3. OpenSea drop slug.
+4. Quantity.
+5. `yes` for a free-mint guard, or `no` plus the maximum price per NFT.
+6. Execution mode: choose `normal` unless you have deliberately configured and tested `aggressive` mode.
 
-For OpenSea Drops it then asks:
+The bot loads active and upcoming stages, skips stages the wallet already used or cannot use, and selects the first eligible stage. Before a stage opens, `OpenSea transaction: DEFERRED until the selected stage is active` is expected. The startup is ready only when you see `Contract: VALID`, `Wallet balance: OK`, `Subscriptions: READY`, and `BOT ARMED`.
 
-1. Whether the mint must remain free. Choose `yes` only if any nonzero mint price must abort.
-2. If it is paid, the maximum acceptable price per NFT in native currency.
-3. Execution mode: choose `normal` for the safer default or `aggressive` only after reading the warnings below.
+When the dry run reaches its trigger, it stops without signing or broadcasting. This confirms startup and monitoring, but intentionally does not build an OpenSea transaction at the trigger. For a saved JSON configuration, use `simulate --config ...` for the stronger API/calldata preflight; it may report that no stage is active if you run it outside a stage window.
 
-For direct contract mode it asks for the price, optional Merkle proof, and trigger. The simple interactive direct mode calls `mint(uint256)` with the requested quantity. Use an advanced JSON configuration when the contract uses a different function or argument layout.
+#### Path B — Direct contract mode
 
-Direct mode performs a final `eth_call` simulation when its trigger becomes ready. If the contract reports a recognizable closed, inactive, paused, or not-started condition, the bot keeps monitoring and retries on later blocks instead of broadcasting a transaction that will obviously revert. If a close/open race still causes a submitted transaction to revert, the bot checks the parent block, refreshes the nonce, and keeps monitoring. Payment, ABI, proof, limit, supply, and gas errors remain fatal so a bad configuration is not retried indefinitely. A timestamp trigger is only a clock; when the contract exposes a boolean such as `mintActive()`, prefer a boolean contract-state trigger.
+Use this path when you already know the collection’s mint function and arguments and do not want OpenSea to build the transaction.
 
-Review the full startup summary. Do not proceed unless all of these are correct:
+For direct mode, leave `OPENSEA_API_KEY` empty and leave the drop-slug prompt blank. If an OpenSea key is present, type `direct` explicitly when the prompt asks for the slug.
 
-- Selected network and contract.
-- Shortened wallet address.
-- Mint quantity.
-- Free-mint or maximum-price guard.
-- Gas limit and maximum gas-cost cap.
-- Trigger or OpenSea stage schedule.
-- In direct mode, the exact Solidity function signature and four-byte selector.
-- The collection contract code hash.
+Start the non-broadcasting verification run:
 
-If anything is wrong, press Ctrl+C and restart with the correct values. Dry-run mode prints `Mode: DRY-RUN`. When its trigger fires, it stops before signing or broadcasting.
+```bash
+./target/release/nft-mint-bot start --dry-run
+```
+
+Answer the prompts in this order:
+
+1. Network.
+2. Collection contract address.
+3. `direct` (only when an OpenSea key is configured), otherwise blank.
+4. Quantity.
+5. Price per NFT. Enter `0` for a free direct mint.
+6. Merkle proof, if the contract legitimately requires one; otherwise leave it blank.
+7. Trigger. Prefer the contract’s boolean sale-state function when one exists; use a timestamp only when that is the contract’s actual opening condition.
+
+The simple interactive direct path encodes `mint(uint256)` with your requested quantity. Use a saved JSON configuration for a different function, such as `publicMint(uint256)`, `mint(address,uint256)`, or `mint(uint256,bytes32[])`.
+
+If the sale is closed, the bot performs an exact `eth_call` preflight when the trigger becomes ready. Recognizable closed, paused, inactive, and not-started responses leave the bot armed and waiting for a later block. A close/open race that still causes a submitted transaction to revert is retried with a refreshed nonce. Payment, ABI, proof, limit, supply, and gas errors remain fatal.
+
+For a direct JSON configuration whose sale is closed during preparation, set `gas.gas_limit` to a trusted fixed limit; otherwise initial gas estimation can correctly fail because the closed contract reverts. Run:
+
+```bash
+./target/release/nft-mint-bot simulate --config configs/my-direct-mint.json
+```
+
+`simulate` executes the exact call immediately. If the sale is still closed, it can report the contract’s closed revert; that is expected. The real `run` monitor performs the same preflight at the trigger and remains armed while it waits for a later block.
+
+Review the full startup summary before using a real run:
+
+- selected network and contract;
+- shortened wallet address and quantity;
+- mint value or OpenSea price guard;
+- gas limit and maximum gas-cost cap;
+- trigger or selected OpenSea stage;
+- direct function signature and selector, when using direct mode;
+- collection contract code hash.
+
+If any value is wrong, press Ctrl+C and restart. Ctrl+C before submission does not send a transaction.
+
+#### Saved configurations and `run`
+
+The interactive `setup` command creates a saved direct-mode JSON configuration and is useful when you need a manual trigger or a non-default function:
+
+```bash
+./target/release/nft-mint-bot setup --output configs
+# Replace <saved-file> with the filename printed by `setup`.
+./target/release/nft-mint-bot simulate --config configs/<saved-file>.json
+./target/release/nft-mint-bot run --config configs/<saved-file>.json --dry-run
+```
+
+OpenSea JSON mode is configured by adding `opensea_drop_slug`, `require_zero_value` or `max_price_per_nft`, and a `block_timestamp` trigger to a copy of [`configs/example.json`](configs/example.json). The full field layout appears in [Advanced JSON configuration](#advanced-json-configuration).
 
 ### Step 11 — Start a real mint
 
-After the dry run and configuration review, start the real executor:
+After the path-specific dry run and configuration review, start the real executor. Use `start` for the interactive OpenSea or direct path:
 
 ```bash
 ./target/release/nft-mint-bot start
@@ -454,19 +509,23 @@ Your ignored `.env` and personal `configs/*.json` files remain local. Review REA
 
 Start with [`configs/example.json`](configs/example.json). One configuration file represents one mint. Personal mint configurations are ignored by Git by default; only the placeholder example is tracked.
 
+#### Complete direct-contract example
+
+This configuration calls `mint(uint256)` directly and waits for the contract’s boolean sale-state function. Replace the contract address and trigger function with the values from the verified contract ABI:
+
 ```json
 {
-  "name": "Example NFT",
-  "chain_id": 8453,
+  "name": "My Direct NFT",
+  "chain_id": 31337,
   "native_currency": "ETH",
-  "contract_address": "0x...",
+  "contract_address": "0x1111111111111111111111111111111111111111",
   "expected_contract_code_hash": null,
   "quantity": 1,
   "mint": {
-    "function": "mint(address,uint256)",
-    "arguments": ["$wallet", "$quantity"],
+    "function": "mint(uint256)",
+    "arguments": ["$quantity"],
     "proof": null,
-    "price_per_nft": "0.005"
+    "price_per_nft": "0.001"
   },
   "trigger": {
     "type": "boolean_contract_state",
@@ -476,9 +535,10 @@ Start with [`configs/example.json`](configs/example.json). One configuration fil
   "gas": {
     "mode": "auto",
     "multiplier": 1.15,
+    "gas_limit": 200000,
     "max_total_gas_cost_native": "0.01"
   },
-  "nonce_strategy": "preloaded",
+  "nonce_strategy": "just_before_trigger",
   "replacement": {
     "enabled": false,
     "after_blocks": 2,
@@ -490,7 +550,71 @@ Start with [`configs/example.json`](configs/example.json). One configuration fil
 }
 ```
 
-Supported argument placeholders are `$wallet`, `$quantity`, and `$proof`. Common dynamic calls include `mint(uint256)`, `publicMint(uint256)`, `mint(address,uint256)`, and `mint(uint256,bytes32[])`.
+Run the direct example in this order:
+
+```bash
+./target/release/nft-mint-bot simulate --config configs/my-direct-mint.json
+./target/release/nft-mint-bot run --config configs/my-direct-mint.json --dry-run
+./target/release/nft-mint-bot run --config configs/my-direct-mint.json
+```
+
+`simulate` performs the exact `eth_call`; `run --dry-run` follows the live trigger path without signing or broadcasting; the final `run` is the real executor. For a free mint, set `price_per_nft` to `"0"`. If gas estimation fails while the sale is closed, set `gas.gas_limit` to a trusted fixed limit as shown in [`configs/example.json`](configs/example.json).
+
+#### Complete OpenSea Drops example
+
+This configuration lets OpenSea select the eligible GTD, FCFS, allowlist, or public stage. The collection address is the NFT contract; the bot validates and uses OpenSea’s canonical SeaDrop target internally. Set `OPENSEA_API_KEY` in `.env` before running it:
+
+```json
+{
+  "name": "My OpenSea Drop",
+  "chain_id": 4663,
+  "native_currency": "native",
+  "contract_address": "0x2222222222222222222222222222222222222222",
+  "expected_contract_code_hash": null,
+  "opensea_drop_slug": "my-drop-slug",
+  "opensea_execution_mode": "normal",
+  "require_zero_value": true,
+  "max_price_per_nft": "0",
+  "quantity": 1,
+  "mint": {
+    "function": "mint(uint256)",
+    "arguments": ["$quantity"],
+    "proof": null,
+    "price_per_nft": "0"
+  },
+  "trigger": {
+    "type": "block_timestamp",
+    "timestamp": 0
+  },
+  "gas": {
+    "mode": "auto",
+    "multiplier": 1.15,
+    "gas_limit": 200000,
+    "max_total_gas_cost_native": "0.001"
+  },
+  "nonce_strategy": "just_before_trigger",
+  "replacement": {
+    "enabled": false,
+    "after_blocks": 2,
+    "fee_multiplier": 1.15,
+    "max_attempts": 2
+  },
+  "expected_start_time": null,
+  "confirmations": 1
+}
+```
+
+Run the OpenSea example in this order:
+
+```bash
+./target/release/nft-mint-bot simulate --config configs/my-opensea-drop.json
+./target/release/nft-mint-bot run --config configs/my-opensea-drop.json --dry-run
+./target/release/nft-mint-bot run --config configs/my-opensea-drop.json
+```
+
+For a paid OpenSea drop, set `require_zero_value` to `false` and set `max_price_per_nft` to the maximum price you accept. OpenSea simulation can report that no stage is active when run outside a stage window; that does not mean the scheduled monitor cannot arm and wait for the next stage.
+
+Supported argument placeholders are `$wallet`, `$quantity`, and `$proof`. Common direct calls include `mint(uint256)`, `publicMint(uint256)`, `mint(address,uint256)`, and `mint(uint256,bytes32[])`.
 
 Direct-mode signing rejects approval, permit, asset-transfer, swap, withdrawal, and generic executor function names/selectors. It then binds the signature to the exact configured contract, calldata, payment value, chain ID, sender, gas limit, and nonce. The same checks run again for fee-bumped replacement transactions.
 
