@@ -259,7 +259,7 @@ Direct contract mode does not require an OpenSea key, so leave `OPENSEA_API_KEY`
 
 You will also need:
 
-- The OpenSea drop slug from the collection URL (the value after `/collection/`), not the collection’s display name.
+- The OpenSea collection/drop slug from the URL (the value after `/collection/` or `/drops/`), not the collection’s display name. The exact slug rules and an example are in Step 10.
 - The NFT collection contract address on the selected network.
 
 OpenSea constructs wallet-specific calldata and selects the first eligible active stage. The bot cannot bypass allowlists, wallet limits, unavailable supply, or OpenSea authorization requirements.
@@ -341,9 +341,35 @@ If you use only a network-specific profile, the interactive startup in Step 10 v
 
 There are two different mint paths. Choose exactly one: OpenSea Drops mode or direct contract mode. Both paths validate the chain, RPC providers, deployed bytecode, wallet balance, gas budget, and subscriptions before printing `BOT ARMED`.
 
+#### Quick decision guide
+
+| Setting | Choose this when | Do not use it when |
+| --- | --- | --- |
+| OpenSea drop slug | The collection is an OpenSea Drop and OpenSea must choose the eligible stage and wallet-specific calldata. | You are calling a contract mint function yourself with a known ABI. |
+| `direct` at the interactive slug prompt | `OPENSEA_API_KEY` happens to be present, but this run is a direct contract mint. | You are configuring JSON; JSON direct mode uses `opensea_drop_slug: null` or omits the field. |
+| Require free mint = `yes` | The intended OpenSea stage must cost exactly zero native currency. Gas is still payable. | The intended stage is paid or you are willing to accept a paid stage. |
+| Require free mint = `no` | The OpenSea stage is paid; enter the highest acceptable **per-NFT** price. | You do not know the maximum price you are willing to pay. |
+| OpenSea `normal` | First runs, uncertain gas requirements, or whenever fresh simulation and balance checks matter most. | Only when you have a tested fixed gas limit and intentionally accept less final-path checking. |
+| OpenSea `aggressive` | A tested, time-critical mint with a trusted fixed gas limit, explicit gas-cost cap, and a dedicated wallet. | First-time testing, unknown gas usage, or a contract whose state may change at the boundary. |
+| Direct `block_timestamp` | The direct contract opens at a known on-chain Unix timestamp. | OpenSea mode; OpenSea should select the stage schedule automatically. |
+| OpenSea `block_timestamp` `0` | You want the bot to load and follow the first active/upcoming eligible stage automatically. | Direct mode; direct `0` means “try on the next block,” not “follow OpenSea stages.” |
+
 #### Path A — OpenSea Drops mode
 
 Use this path when the collection is an OpenSea Drop and the wallet must be checked against OpenSea’s live stages and eligibility.
+
+##### Finding the correct drop slug
+
+OpenSea’s API calls this the **collection slug**. It is the path component used by the Drops API endpoint `https://api.opensea.io/api/v2/drops/{slug}`. For example:
+
+```text
+OpenSea collection URL: https://opensea.io/collection/onchain-sketches
+Value to enter:         onchain-sketches
+```
+
+Copy only the slug: do not include `https://`, `/collection/`, `/drops/`, query parameters, the contract address, or the display name. If the collection is presented through an OpenSea Drops URL, use the slug after `/drops/`; the API still expects the collection slug. OpenSea’s [drop-details endpoint](https://docs.opensea.io/reference/get_drop_by_slug) is the authoritative check: a valid slug identifies the collection and returns its stages and supply.
+
+Do not guess a slug from a ticker or marketplace title. If the API returns “not found,” stop and correct the slug before arming. A stage being inactive is different from a slug being invalid.
 
 Before starting, confirm that:
 
@@ -373,6 +399,10 @@ Answer the prompts in this order:
 5. `yes` for a free-mint guard, or `no` plus the maximum price per NFT.
 6. Execution mode: choose `normal` unless you have deliberately configured and tested `aggressive` mode.
 
+Use **free-mint = yes** only when the intended stage should send exactly `0` native currency. The guard rejects any nonzero value returned by OpenSea; it does not make gas free. Use **free-mint = no** for a paid stage and enter the maximum price for one NFT, not the total. The bot multiplies that cap by quantity and refuses to sign if OpenSea returns more.
+
+Use **normal** for the first run and for ordinary mints. It performs fresh gas simulation, balance checks, and just-in-time nonce selection. Use **aggressive** only for a tested contract when trigger latency is critical and you already know a safe fixed gas limit and maximum total gas cost. Aggressive mode skips live gas simulation and the final balance RPC, so a wrong gas limit or changed contract state can still produce a gas-paying revert.
+
 The bot loads active and upcoming stages, skips stages the wallet already used or cannot use, and selects the first eligible stage. Before a stage opens, `OpenSea transaction: DEFERRED until the selected stage is active` is expected. The startup is ready only when you see `Contract: VALID`, `Wallet balance: OK`, `Subscriptions: READY`, and `BOT ARMED`.
 
 When the dry run reaches its trigger, it stops without signing or broadcasting. This confirms startup and monitoring, but intentionally does not build an OpenSea transaction at the trigger. For a saved JSON configuration, use `simulate --config ...` for the stronger API/calldata preflight; it may report that no stage is active if you run it outside a stage window.
@@ -382,6 +412,8 @@ When the dry run reaches its trigger, it stops without signing or broadcasting. 
 Use this path when you already know the collection’s mint function and arguments and do not want OpenSea to build the transaction.
 
 For direct mode, leave `OPENSEA_API_KEY` empty and leave the drop-slug prompt blank. If an OpenSea key is present, type `direct` explicitly when the prompt asks for the slug.
+
+`direct` is only a word understood by the interactive wizard. In a JSON file, use `"opensea_drop_slug": null` or omit `opensea_drop_slug`; do not put `"direct"` in that field, because the JSON loader would treat it as an actual OpenSea slug.
 
 Start the non-broadcasting verification run:
 
@@ -398,6 +430,23 @@ Answer the prompts in this order:
 5. Price per NFT. Enter `0` for a free direct mint.
 6. Merkle proof, if the contract legitimately requires one; otherwise leave it blank.
 7. Trigger. Prefer the contract’s boolean sale-state function when one exists; use a timestamp only when that is the contract’s actual opening condition.
+
+Direct mode has no OpenSea free-mint toggle. The exact native payment is `quantity × mint.price_per_nft`; use `"0"` for a free direct call. The contract may still charge gas. The direct signing policy rejects approval, permit, transfer, swap, withdrawal, and generic executor calls, so configure only the verified mint/claim function needed by the collection.
+
+##### Direct timestamp trigger
+
+Use a real Unix timestamp only when the contract’s direct sale opens at a known chain timestamp. Unix time is UTC seconds since `1970-01-01`, for example `1788102900`; do not enter a local date string or milliseconds. The bot compares the incoming block’s `block.timestamp` with your value using `>=`, so a timestamp already in the past fires on the next block.
+
+If the contract exposes `publicSaleActive()`, `mintActive()`, or another reliable boolean/numeric phase view, prefer that trigger: it observes the contract’s actual state instead of assuming a clock schedule. For a direct JSON timestamp trigger:
+
+```json
+"trigger": {
+  "type": "block_timestamp",
+  "timestamp": 1788102900
+}
+```
+
+Do not use `timestamp: 0` to mean “wait for the direct sale to open.” In direct mode it is already true on the first observed block; the bot’s closed-sale preflight may keep waiting afterward, but an explicit boolean trigger is clearer.
 
 The simple interactive direct path encodes `mint(uint256)` with your requested quantity. Use a saved JSON configuration for a different function, such as `publicMint(uint256)`, `mint(address,uint256)`, or `mint(uint256,bytes32[])`.
 
