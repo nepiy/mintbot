@@ -8,6 +8,7 @@ The interactive launcher supports:
 
 - Robinhood Chain mainnet — chain ID `4663`
 - Ink mainnet — chain ID `57073`
+- HyperEVM mainnet — chain ID `999` (native gas token: HYPE)
 
 Advanced JSON configurations can target other EVM-compatible networks by providing the correct chain ID, RPC endpoints, contract address, mint ABI, and trigger.
 
@@ -240,10 +241,13 @@ The interactive launcher supports these profiles:
 | --- | ---: | --- |
 | Robinhood Chain mainnet | `4663` | `ROBINHOOD_HTTP_RPC_URL`, `ROBINHOOD_WS_RPC_URL` |
 | Ink mainnet | `57073` | `INK_HTTP_RPC_URL`, `INK_WS_RPC_URL` |
+| HyperEVM mainnet | `999` | `HYPEREVM_HTTP_RPC_URL`, `HYPEREVM_WS_RPC_URL` |
 
 If either network-specific HTTP or WebSocket variable is filled, that profile is selected and both values must be valid. If a selected network has no profile values, the bot falls back to `HTTP_RPC_URL` and `WS_RPC_URL`.
 
 The included `.env.example` contains Ink’s public HTTPS and WebSocket endpoints. Replace them with dedicated endpoints when reliability matters. See [Ink RPC documentation](https://docs.inkonchain.com/tools/rpc).
+
+For HyperEVM, the official HTTPS endpoint is `https://rpc.hyperliquid.xyz/evm` and HYPE is the native gas token. Hyperliquid’s official endpoint does not provide WebSocket JSON-RPC, so configure `HYPEREVM_WS_RPC_URL` with a WSS-capable HyperEVM provider for block monitoring. Keep `HYPEREVM_HTTP_RPC_URL` and any backup/broadcast URLs on HyperEVM. See [Hyperliquid HyperEVM documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm).
 
 ### Step 7 — Obtain an OpenSea API key if needed
 
@@ -312,6 +316,11 @@ INK_HTTP_RPC_URL=https://rpc-gel.inkonchain.com
 INK_WS_RPC_URL=wss://ws-gel.inkonchain.com
 INK_BACKUP_RPC_URL=
 INK_BROADCAST_RPC_URLS=
+
+HYPEREVM_HTTP_RPC_URL=https://rpc.hyperliquid.xyz/evm
+HYPEREVM_WS_RPC_URL=wss://your-hyperevm-websocket-rpc.example
+HYPEREVM_BACKUP_RPC_URL=
+HYPEREVM_BROADCAST_RPC_URLS=
 ```
 
 Environment-variable rules:
@@ -616,8 +625,8 @@ This configuration lets OpenSea select the eligible GTD, FCFS, allowlist, or pub
 ```json
 {
   "name": "My OpenSea Drop",
-  "chain_id": 4663,
-  "native_currency": "native",
+  "chain_id": 999,
+  "native_currency": "HYPE",
   "contract_address": "0x2222222222222222222222222222222222222222",
   "expected_contract_code_hash": null,
   "opensea_drop_slug": "my-drop-slug",

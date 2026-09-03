@@ -394,6 +394,7 @@ fn opensea_chain_slug(chain_id: u64) -> Result<&'static str> {
     match chain_id {
         crate::config::ROBINHOOD_MAINNET_CHAIN_ID => Ok("robinhood"),
         crate::config::INK_MAINNET_CHAIN_ID => Ok("ink"),
+        crate::config::HYPEREVM_MAINNET_CHAIN_ID => Ok("hyperevm"),
         _ => Err(BotError::Config(format!(
             "OpenSea contract verification is not configured for chain ID {chain_id}"
         ))),
@@ -776,6 +777,7 @@ mod tests {
     fn binds_contract_verification_to_supported_opensea_chains() {
         assert_eq!(opensea_chain_slug(4663).unwrap(), "robinhood");
         assert_eq!(opensea_chain_slug(57073).unwrap(), "ink");
+        assert_eq!(opensea_chain_slug(999).unwrap(), "hyperevm");
         assert!(opensea_chain_slug(1).is_err());
         assert_eq!(
             collection_slug_from_contract_response(&json!({

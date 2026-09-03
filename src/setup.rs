@@ -1,8 +1,9 @@
 use crate::{
     config::{
-        GasConfig, INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE, INK_MAINNET_CHAIN_ID,
-        MintCallConfig, MintConfig, MintTrigger, NonceStrategy, OpenSeaExecutionMode,
-        ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
+        GasConfig, HYPEREVM_DEFAULT_GAS_LIMIT, HYPEREVM_DEFAULT_MAX_GAS_COST_NATIVE,
+        HYPEREVM_MAINNET_CHAIN_ID, INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE,
+        INK_MAINNET_CHAIN_ID, MintCallConfig, MintConfig, MintTrigger, NonceStrategy,
+        OpenSeaExecutionMode, ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
         ROBINHOOD_MAINNET_CHAIN_ID,
     },
     error::{BotError, Result},
@@ -29,6 +30,10 @@ struct ManualControlInfo {
 fn gas_defaults(chain_id: u64) -> (u64, &'static str) {
     match chain_id {
         INK_MAINNET_CHAIN_ID => (INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE),
+        HYPEREVM_MAINNET_CHAIN_ID => (
+            HYPEREVM_DEFAULT_GAS_LIMIT,
+            HYPEREVM_DEFAULT_MAX_GAS_COST_NATIVE,
+        ),
         _ => (
             ROBINHOOD_DEFAULT_GAS_LIMIT,
             ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
@@ -67,13 +72,16 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
             .map_err(|err| BotError::Config(format!("invalid chain ID: {err}")))?;
         (chain_id, None)
     } else {
-        println!("Select network:\n1. Robinhood Chain mainnet\n2. Ink mainnet");
+        println!(
+            "Select network:\n1. Robinhood Chain mainnet\n2. Ink mainnet\n3. HyperEVM mainnet"
+        );
         match ask("Network", "1")?.trim() {
             "1" => (ROBINHOOD_MAINNET_CHAIN_ID, Some("Robinhood Chain mainnet")),
             "2" => (INK_MAINNET_CHAIN_ID, Some("Ink mainnet")),
+            "3" => (HYPEREVM_MAINNET_CHAIN_ID, Some("HyperEVM mainnet")),
             _ => {
                 return Err(BotError::Config(
-                    "network must be 1 (Robinhood) or 2 (Ink)".to_string(),
+                    "network must be 1 (Robinhood), 2 (Ink), or 3 (HyperEVM)".to_string(),
                 ));
             }
         }
@@ -85,6 +93,8 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     let name = name.unwrap_or_else(|| {
         if chain_id == INK_MAINNET_CHAIN_ID {
             "Ink NFT".to_string()
+        } else if chain_id == HYPEREVM_MAINNET_CHAIN_ID {
+            "HyperEVM NFT".to_string()
         } else {
             "Robinhood NFT".to_string()
         }
@@ -149,7 +159,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         let config = MintConfig {
             name,
             chain_id,
-            native_currency: None,
+            native_currency: (chain_id == HYPEREVM_MAINNET_CHAIN_ID).then(|| "HYPE".to_string()),
             contract_address,
             expected_contract_code_hash: None,
             opensea_drop_slug: Some(opensea_drop_slug),
@@ -288,7 +298,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     let config = MintConfig {
         name,
         chain_id,
-        native_currency: None,
+        native_currency: (chain_id == HYPEREVM_MAINNET_CHAIN_ID).then(|| "HYPE".to_string()),
         contract_address,
         expected_contract_code_hash: None,
         opensea_drop_slug: None,
