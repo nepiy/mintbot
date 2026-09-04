@@ -463,11 +463,9 @@ async fn refresh_schedule(
                 continue;
             }
         };
-        let now = unix_seconds();
-        let mut current = stages
-            .into_iter()
-            .filter(|stage| stage.end_time.is_none_or(|end_time| end_time >= now))
-            .collect::<Vec<_>>();
+        // Wall time may tune polling frequency, but must never discard a
+        // stage. The monitor filters stages using incoming chain timestamps.
+        let mut current = stages;
         current.sort_by_key(|stage| stage.start_time);
         if current.is_empty() || current == previous {
             continue;

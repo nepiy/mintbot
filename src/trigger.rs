@@ -106,12 +106,15 @@ impl TriggerEngine {
             }
             return TriggerObservation::NotReady;
         }
-        self.pending_event = block_number.map(|block_number| PendingEvent {
+        let (Some(block_number), Some(block_hash)) = (block_number, block_hash) else {
+            return TriggerObservation::NotReady;
+        };
+        self.pending_event = Some(PendingEvent {
             block_number,
-            block_hash,
+            block_hash: Some(block_hash),
         });
         let confirmations = confirmations.unwrap_or(0);
-        if confirmations == 0 {
+        if confirmations <= 1 {
             return TriggerObservation::Ready;
         }
         TriggerObservation::NotReady
@@ -162,7 +165,7 @@ impl TriggerEngine {
                 };
                 let needed = event
                     .block_number
-                    .saturating_add(confirmations.unwrap_or(0));
+                    .saturating_add(confirmations.unwrap_or(0).saturating_sub(1));
                 Ok(if header.number() >= needed {
                     TriggerObservation::Ready
                 } else {
@@ -223,5 +226,54 @@ impl TriggerEngine {
                 function.signature()
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn event_inclusion_counts_as_the_first_confirmation() {
+        let (rpc, server) =
+            crate::rpc::tests::mock_rpc(|_| panic!("event count needs no RPC")).await;
+        for confirmations in [0_u64, 1, 2, 5] {
+            let config: MintConfig = serde_json::from_value(serde_json::json!({
+                "name":"event test", "chain_id":1,
+                "contract_address":"0x0000000000000000000000000000000000000001",
+                "quantity":1, "mint":{"function":"mint(uint256)"},
+                "trigger":{"type":"contract_event", "signature":"SaleStarted()", "confirmations":confirmations}
+            })).unwrap();
+            let mut engine = TriggerEngine::new(&config).unwrap();
+            assert_eq!(
+                engine.observe_event(None, None, false),
+                TriggerObservation::NotReady
+            );
+            assert_eq!(
+                engine.observe_event(Some(100), None, false),
+                TriggerObservation::NotReady
+            );
+            assert_eq!(
+                engine.observe_event(Some(100), Some(B256::ZERO), false),
+                if confirmations <= 1 {
+                    TriggerObservation::Ready
+                } else {
+                    TriggerObservation::NotReady
+                }
+            );
+            let needed = 100 + confirmations.saturating_sub(1);
+            let mut header: Header = Header::default();
+            header.inner.number = needed - 1;
+            assert_eq!(
+                engine.observe_block(&header, &rpc).await.unwrap(),
+                TriggerObservation::NotReady
+            );
+            header.inner.number = needed;
+            assert_eq!(
+                engine.observe_block(&header, &rpc).await.unwrap(),
+                TriggerObservation::Ready
+            );
+        }
+        server.abort();
     }
 }

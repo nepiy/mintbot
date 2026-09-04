@@ -22,12 +22,12 @@ In OpenSea mode, the contract you enter is the NFT collection contract. The bot 
 
 - Validates the configured chain ID, RPC providers, and deployed contract bytecode before arming.
 - Requires encrypted `https://` and `wss://` RPC transport outside local development.
-- Keeps the private key in memory, loads it only from `.env`, and prints only a shortened wallet address.
+- Keeps the private key in memory, loads it from the working directory's `.env` or the process environment, and prints only a shortened wallet address.
 - Uses a dedicated wallet recommendation and owner-only permissions for `.env` and generated configuration files.
 - Uses a one-shot atomic trigger transition, so competing block, event, or manual triggers produce at most one submission attempt.
 - Uses the latest live OpenSea price/value and refuses to sign above the configured cap.
 - Free-mint mode refuses any nonzero payment.
-- Applies a maximum total gas-cost cap before arming and before submission.
+- Checks a configured fee budget before submission; Ink checks include buffered L1 data and operator fees. This is not an on-chain guarantee for inclusion-time L2 surcharges.
 - Serializes just-in-time nonce selection across local bot processes.
 - Blocks direct-mode approval, permit, transfer, swap, withdrawal, and generic executor selectors.
 - Revalidates the exact sender, chain, target, calldata, payment, gas, nonce, and transaction type immediately before every initial or replacement signature.
@@ -334,7 +334,7 @@ Environment-variable rules:
 - `RUST_LOG=nft_mint_bot=info` is the recommended default.
 - Do not wrap values in angle brackets and do not leave placeholder URLs in fields the selected profile will use.
 
-The real `.env` is ignored by Git. On macOS and Linux, the bot refuses to start if `.env` is readable by other users; fix that with `chmod 600 .env`.
+The real `.env` is ignored by Git. The bot loads only the `.env` in the current working directory, never one in a parent directory. On macOS and Linux, the bot refuses to start if `.env` is readable by other users; fix that with `chmod 600 .env`. Malformed local `.env` files also stop startup without printing their contents.
 
 ### Step 9 — Check RPC connectivity
 
@@ -410,7 +410,7 @@ Answer the prompts in this order:
 
 Use **free-mint = yes** only when the intended stage should send exactly `0` native currency. The guard rejects any nonzero value returned by OpenSea; it does not make gas free. Use **free-mint = no** for a paid stage and enter the maximum price for one NFT, not the total. The bot multiplies that cap by quantity and refuses to sign if OpenSea returns more.
 
-Use **normal** for the first run and for ordinary mints. It performs fresh gas simulation, balance checks, and just-in-time nonce selection. Use **aggressive** only for a tested contract when trigger latency is critical and you already know a safe fixed gas limit and maximum total gas cost. Aggressive mode skips live gas simulation and the final balance RPC, so a wrong gas limit or changed contract state can still produce a gas-paying revert.
+Use **normal** for the first run and for ordinary mints. It performs fresh gas simulation, balance checks, and just-in-time nonce selection. Without a fixed gas limit, OpenSea gas estimation and the final budget check are deferred until eligible SeaDrop calldata is available; the placeholder cannot be signed. Use **aggressive** only for a tested contract when trigger latency is critical and you already know a safe fixed gas limit and fee budget. Aggressive mode skips live gas simulation and normally uses a cached balance. Ink still performs fresh surcharge and balance checks before signing in either mode. A wrong gas limit or changed contract state can still produce a gas-paying revert.
 
 The bot loads active and upcoming stages, skips stages the wallet already used or cannot use, and selects the first eligible stage. Before a stage opens, `OpenSea transaction: DEFERRED until the selected stage is active` is expected. The startup is ready only when you see `Contract: VALID`, `Wallet balance: OK`, `Subscriptions: READY`, and `BOT ARMED`.
 
@@ -741,11 +741,13 @@ For a `manual` trigger, run the bot and then send the authenticated local trigge
 - `contract_event`: subscribe to an event such as `PublicSaleStarted()` and optionally wait for confirmations.
 - `manual`: wait for the authenticated local control command.
 
-The timestamp trigger uses the chain header, not the computer’s local clock. View triggers read the configured contract at the exact incoming block hash. Event subscriptions are restricted to the configured contract and event signature; canonicality is rechecked after confirmations.
+The timestamp trigger and OpenSea stage selection, expiry, and retry deadlines use chain timestamps, not the computer's local clock. View triggers read the configured contract at the exact incoming block hash. Event subscriptions are restricted to the configured contract and event signature; canonicality is rechecked before triggering. The inclusion block counts as confirmation 1: an event in block 100 reaches 2 confirmations at block 101. A setting of 0 also requires a mined, canonical event.
 
 ### Gas and nonce behavior
 
-Gas modes are `auto`, `eip1559`, `legacy`, and `manual`. Auto mode estimates EIP-1559 fees, applies the configured multiplier, and refreshes fee fields while waiting. `max_total_gas_cost_native` is only a safety ceiling; the actual fee is gas used multiplied by the effective gas price.
+Gas modes are `auto`, `eip1559`, `legacy`, and `manual`. Auto mode estimates EIP-1559 fees, applies the configured multiplier, and refreshes fee fields while waiting. `max_total_gas_cost_native` is a pre-broadcast budget, separate from the mint payment. Execution fees are bounded by gas limit multiplied by the transaction's fee cap.
+
+On Ink, every initial and replacement signing also checks the live balance and adds twice the oracle's L1 data upper-bound estimate plus twice its operator-fee estimate to the execution budget. If either oracle call is unavailable or malformed, signing stops. The L1 estimate conservatively includes transaction-encoding overhead. These extra fees can change before inclusion, so the budget is **not a guaranteed total-fee cap on-chain**. Keep a margin and use a dedicated low-balance wallet. The receipt's displayed execution fee excludes L2 surcharges. Custom chains with additional fee components require a chain-specific estimator; only Ink's surcharges are currently modeled.
 
 Nonce modes are:
 
@@ -754,6 +756,18 @@ Nonce modes are:
 - `just_before_trigger`: obtains the pending nonce after the trigger wins and immediately before signing.
 
 Ctrl+C stops an armed monitor without submitting. After a transaction has been submitted, Ctrl+C stops receipt monitoring but cannot cancel the blockchain transaction; keep the printed hash for independent tracking.
+
+### Regression checks
+
+Run `cargo +1.94.1 test --locked --all-targets` and `cargo +1.94.1 clippy --locked --all-targets --all-features -- -D warnings`. Network regression tests require permission to bind loopback listeners; they use local mock servers, not live wallets.
+
+The secret-scanner regression is opt-in because it requires a separately installed Gitleaks executable (verified with version 8.30.1):
+
+```bash
+GITLEAKS_BIN=/absolute/path/to/gitleaks cargo +1.94.1 test --locked --test security_scan_test -- --ignored
+```
+
+It uses synthetic fixtures to verify that `.env` and benchmark source files are scanned. It never reads the real `.env`.
 
 ### Local Anvil test
 

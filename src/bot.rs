@@ -28,7 +28,7 @@ use alloy::{
 use futures_util::StreamExt;
 use std::{
     path::PathBuf,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 use tokio::sync::watch;
 
@@ -96,8 +96,13 @@ async fn run_bot_with_config(
     } else {
         None
     };
+    let last_chain_timestamp = if opensea_client.is_some() {
+        rpc.latest_timestamp().await?
+    } else {
+        0
+    };
     let opensea_stages = match opensea_client.as_ref() {
-        Some(client) => load_opensea_stage_schedule(&config, client).await?,
+        Some(client) => load_opensea_stage_schedule(&config, client, last_chain_timestamp).await?,
         None => Vec::new(),
     };
     if let Some(stage) = opensea_stages.first() {
@@ -114,7 +119,7 @@ async fn run_bot_with_config(
             .await?;
     }
     let mut trigger_engine = TriggerEngine::new(&config)?;
-    println!("Wallet balance: OK");
+    println!("Startup balance check: OK; final fee budget rechecked before submission");
     if config.opensea_drop_slug.is_some() {
         println!("OpenSea transaction: DEFERRED until the selected stage is active");
     } else {
@@ -179,6 +184,7 @@ async fn run_bot_with_config(
         dry_run,
         dynamic_fields_healthy: true,
         last_seen_block,
+        last_chain_timestamp,
         last_closed_retry_notice: None,
         opensea_stages,
         opensea_stage_index: 0,
@@ -224,6 +230,7 @@ pub async fn run_simulation(config_path: PathBuf) -> Result<()> {
         )
     );
     println!("Estimated gas: {}", prepared.gas_limit);
+    validate_chain_fee_budget(&config, &rpc, wallet.address, &prepared.request).await?;
     simulate_call(&rpc, prepared.request.clone()).await?;
     println!("\nSimulation: SUCCESS");
     println!("Configuration appears ready.");
@@ -236,11 +243,6 @@ pub async fn prepare_transaction(
     wallet: &LoadedWallet,
 ) -> Result<PreparedTransaction> {
     let contract = config.contract()?;
-    if config.opensea_drop_slug.is_some() {
-        // Fail before arming if the API credential is missing rather than
-        // discovering it only when the stage opens.
-        let _ = OpenSeaClient::from_env()?;
-    }
     let (calldata, mint_value) = if config.opensea_drop_slug.is_some() {
         // OpenSea only returns valid calldata once an eligible stage is active.
         // Build a safe zero-value placeholder so the bot can arm in advance.
@@ -268,6 +270,10 @@ pub async fn prepare_transaction(
 
     let gas_limit = if let Some(limit) = config.gas.gas_limit {
         limit
+    } else if config.opensea_drop_slug.is_some() {
+        // Normal mode estimates the real SeaDrop call at hydration, not this
+        // empty placeholder. A zero gas limit can never pass signing policy.
+        0
     } else {
         rpc.estimate_gas(request.clone()).await.map_err(|err| {
             BotError::Transaction(format!(
@@ -368,6 +374,7 @@ pub async fn prepare_transaction(
 async fn load_opensea_stage_schedule(
     config: &MintConfig,
     client: &OpenSeaClient,
+    now: u64,
 ) -> Result<Vec<OpenSeaStage>> {
     let Some(drop_slug) = config.opensea_drop_slug.as_deref() else {
         return Ok(Vec::new());
@@ -383,10 +390,6 @@ async fn load_opensea_stage_schedule(
     let drop = client.get_drop(drop_slug).await?;
     ensure_opensea_supply(&drop, config.quantity)?;
     let stages = drop.stages;
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
     let mut stages = stages
         .into_iter()
         .filter(|stage| {
@@ -568,8 +571,20 @@ fn validate_transaction_budget_with_balance(
     gas_limit: u64,
     fee_cap: u128,
 ) -> Result<()> {
+    validate_budget_with_extra_fee(config, balance, mint_value, gas_limit, fee_cap, U256::ZERO)
+}
+
+fn validate_budget_with_extra_fee(
+    config: &MintConfig,
+    balance: U256,
+    mint_value: U256,
+    gas_limit: u64,
+    fee_cap: u128,
+    extra_fee: U256,
+) -> Result<()> {
     let maximum_gas_cost = U256::from(gas_limit)
         .checked_mul(U256::from(fee_cap))
+        .and_then(|execution| execution.checked_add(extra_fee))
         .ok_or_else(|| BotError::Transaction("gas cost overflowed U256".to_string()))?;
     if let Some(maximum) = config.gas.max_total_gas_cost_native.as_deref() {
         let maximum = parse_native_amount(maximum)?;
@@ -592,6 +607,42 @@ fn validate_transaction_budget_with_balance(
     Ok(())
 }
 
+async fn validate_chain_fee_budget(
+    config: &MintConfig,
+    rpc: &RpcClients,
+    wallet: Address,
+    request: &TransactionRequest,
+) -> Result<()> {
+    if config.chain_id != crate::config::INK_MAINNET_CHAIN_ID {
+        return Ok(());
+    }
+    let calldata_len = request
+        .input
+        .input
+        .as_ref()
+        .or(request.input.data.as_ref())
+        .map_or(0, |data| data.len());
+    let gas = request
+        .gas
+        .ok_or_else(|| signing_policy_error("missing gas limit"))?;
+    let fee = request
+        .gas_price
+        .or(request.max_fee_per_gas)
+        .ok_or_else(|| signing_policy_error("missing fee cap"))?;
+    let (reserve, balance) = tokio::try_join!(
+        rpc.ink_extra_fee_reserve(calldata_len, gas),
+        rpc.check_balance(wallet),
+    )?;
+    validate_budget_with_extra_fee(
+        config,
+        balance,
+        request.value.unwrap_or_default(),
+        gas,
+        fee,
+        reserve,
+    )
+}
+
 struct MonitorContext<'a> {
     config: &'a MintConfig,
     rpc: &'a mut RpcClients,
@@ -603,6 +654,7 @@ struct MonitorContext<'a> {
     dry_run: bool,
     dynamic_fields_healthy: bool,
     last_seen_block: Option<u64>,
+    last_chain_timestamp: u64,
     last_closed_retry_notice: Option<Instant>,
     opensea_stages: Vec<OpenSeaStage>,
     opensea_stage_index: usize,
@@ -775,6 +827,7 @@ async fn monitor_block_stream(
                     return Err(MonitorFailure::Transport(BotError::Rpc("block subscription closed".to_string())));
                 };
                 context.last_seen_block = Some(header.number());
+                context.last_chain_timestamp = header.timestamp();
                 if let Err(err) = context.apply_opensea_schedule_update() {
                     return Err(MonitorFailure::Execution(err));
                 }
@@ -847,6 +900,7 @@ async fn monitor_event_stream(
                     return Err(MonitorFailure::Transport(BotError::Rpc("block subscription closed".to_string())));
                 };
                 context.last_seen_block = Some(header.number());
+                context.last_chain_timestamp = header.timestamp();
                 if let Err(err) = context.apply_opensea_schedule_update() {
                     return Err(MonitorFailure::Execution(err));
                 }
@@ -906,6 +960,9 @@ async fn monitor_event_stream(
                     log.removed,
                 );
                 if observation != TriggerObservation::Ready {
+                    continue;
+                }
+                if !event_is_canonical(context, filter).await {
                     continue;
                 }
                 match ensure_transaction_ready(context).await {
@@ -1017,6 +1074,9 @@ async fn apply_event_backfill(
         }
     }
     context.last_seen_block = Some(to_block);
+    if ready_at.is_some() && !event_is_canonical(context, filter).await {
+        return Ok(None);
+    }
     Ok(ready_at)
 }
 
@@ -1170,6 +1230,15 @@ async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bo
             Err(error) => return Err(error),
         }
     }
+    if context.dry_run {
+        validate_chain_fee_budget(
+            context.config,
+            context.rpc,
+            context.wallet.address,
+            &context.prepared.request,
+        )
+        .await?;
+    }
     Ok(true)
 }
 
@@ -1178,7 +1247,7 @@ impl MonitorContext<'_> {
         if !self.auto_opensea_schedule {
             return Ok(());
         }
-        let retry_at = automatic_opensea_retry_timestamp(delay_seconds);
+        let retry_at = automatic_opensea_retry_timestamp(self.last_chain_timestamp, delay_seconds);
         self.trigger_engine.set_block_timestamp(retry_at)?;
         self.prepared.opensea_hydrated = false;
         Ok(())
@@ -1195,7 +1264,10 @@ impl MonitorContext<'_> {
             return Ok(());
         }
 
-        let updated = schedule.borrow_and_update().clone();
+        let updated = unexpired_stages(
+            schedule.borrow_and_update().clone(),
+            self.last_chain_timestamp,
+        );
         if updated.is_empty() {
             return Ok(());
         }
@@ -1231,15 +1303,7 @@ impl MonitorContext<'_> {
             }
         };
         ensure_opensea_supply(&drop, self.config.quantity)?;
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let mut stages = drop
-            .stages
-            .into_iter()
-            .filter(|stage| stage.end_time.is_none_or(|end_time| end_time >= now))
-            .collect::<Vec<_>>();
+        let mut stages = unexpired_stages(drop.stages, self.last_chain_timestamp);
         stages.sort_by_key(|stage| stage.start_time);
         if stages.is_empty() || stages == self.opensea_stages {
             return Ok(false);
@@ -1331,10 +1395,7 @@ fn is_ambiguous_opensea_precondition(error: &BotError) -> bool {
 }
 
 fn advance_to_started_opensea_stage(context: &mut MonitorContext<'_>) -> Result<bool> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = context.last_chain_timestamp;
     if !next_opensea_stage_has_started(&context.opensea_stages, context.opensea_stage_index, now) {
         return Ok(false);
     }
@@ -1419,17 +1480,20 @@ fn refreshed_stage_index(
         .unwrap_or_else(|| previous_index.min(updated.len().saturating_sub(1)))
 }
 
-fn automatic_opensea_retry_timestamp(delay_seconds: u64) -> u64 {
+fn unexpired_stages(stages: Vec<OpenSeaStage>, chain_timestamp: u64) -> Vec<OpenSeaStage> {
+    stages
+        .into_iter()
+        .filter(|stage| stage.end_time.is_none_or(|end| end >= chain_timestamp))
+        .collect()
+}
+
+fn automatic_opensea_retry_timestamp(chain_timestamp: u64, delay_seconds: u64) -> u64 {
     if delay_seconds == 0 {
         // The current block has already been processed, so zero makes the
         // trigger ready on the next block without relying on wall-clock skew.
         return 0;
     }
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .saturating_add(delay_seconds)
+    chain_timestamp.saturating_add(delay_seconds)
 }
 
 async fn refresh_transaction_fields(
@@ -1533,6 +1597,7 @@ async fn execute_transaction(
     }
     metrics.finalization_completed = Some(Instant::now());
     validate_signing_request(config, wallet.address, prepared, &request)?;
+    validate_chain_fee_budget(config, rpc, wallet.address, &request).await?;
     state.store(BotState::Signing);
     metrics.signing_started = Some(Instant::now());
     let signed = wallet.sign_request(request.clone()).await?;
@@ -1654,7 +1719,7 @@ async fn monitor_receipt(
             println!("Gas used: {}", receipt.gas_used);
             println!("Effective gas price: {} wei", receipt.effective_gas_price);
             println!(
-                "Total transaction fee: {} wei",
+                "Execution transaction fee (excludes any L2 surcharges): {} wei",
                 u128::from(receipt.gas_used) * receipt.effective_gas_price
             );
             if receipt.status() {
@@ -1708,6 +1773,13 @@ async fn monitor_receipt(
                         validate_signing_request(config, wallet.address, prepared, &replacement)
                     {
                         tracing::error!(error = %err, "replacement blocked by signing policy; original receipt monitoring continues");
+                        replacements = config.replacement.max_attempts;
+                        continue;
+                    }
+                    if let Err(err) =
+                        validate_chain_fee_budget(config, rpc, wallet.address, &replacement).await
+                    {
+                        tracing::warn!(error = %err, "replacement fee budget check failed; original receipt monitoring continues");
                         replacements = config.replacement.max_attempts;
                         continue;
                     }
@@ -1767,6 +1839,11 @@ fn validate_signing_request(
     }
     if request.gas != Some(prepared.gas_limit) {
         return Err(signing_policy_error("transaction gas limit changed"));
+    }
+    if prepared.gas_limit == 0 {
+        return Err(signing_policy_error(
+            "transaction gas estimation is still deferred",
+        ));
     }
     if request.nonce.is_none() {
         return Err(signing_policy_error("transaction nonce is missing"));
@@ -1972,10 +2049,19 @@ fn print_armed(
         );
     }
     println!("Wallet: {}", short_address(wallet.address));
-    println!("Gas limit: {}", prepared.gas_limit);
+    if prepared.gas_limit == 0 {
+        println!("Gas limit and final gas/balance budget: DEFERRED until OpenSea hydration");
+    } else {
+        println!("Gas limit: {}", prepared.gas_limit);
+    }
     println!("Current maximum fee: {} wei/gas", prepared.fee_cap);
     if let Some(maximum) = config.gas.max_total_gas_cost_native.as_deref() {
-        println!("Maximum total gas cost: {maximum} native currency");
+        println!("Pre-broadcast fee budget: {maximum} native currency");
+    }
+    if config.chain_id == crate::config::INK_MAINNET_CHAIN_ID {
+        println!(
+            "Ink: final checks include buffered L1/operator fees; inclusion-time fees can change."
+        );
     }
     println!(
         "Nonce: {}",
@@ -2044,6 +2130,141 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn normal_opensea_defers_placeholder_estimation_and_cannot_sign_it() {
+        use super::*;
+        let mut config = opensea_config(true, None);
+        config.gas.mode = GasMode::Legacy;
+        config.gas.gas_price_gwei = Some("1".into());
+        config.gas.gas_limit = None;
+        config.nonce_strategy = NonceStrategy::JustBeforeTrigger;
+        let signer: alloy::signers::local::PrivateKeySigner =
+            "0000000000000000000000000000000000000000000000000000000000000001"
+                .parse()
+                .unwrap();
+        let wallet = LoadedWallet {
+            address: signer.address(),
+            wallet: alloy::network::EthereumWallet::new(signer),
+        };
+        let (rpc, server) = crate::rpc::tests::mock_rpc(|request| {
+            assert_eq!(
+                request["method"], "eth_getBalance",
+                "placeholder must not be estimated"
+            );
+            serde_json::json!("0xde0b6b3a7640000")
+        })
+        .await;
+        let prepared = prepare_transaction(&config, &rpc, &wallet).await.unwrap();
+        assert_eq!(prepared.gas_limit, 0);
+        assert!(
+            validate_signing_request(&config, wallet.address, &prepared, &prepared.request)
+                .is_err()
+        );
+        let otherwise_ready = prepared
+            .request
+            .clone()
+            .with_to(OPENSEA_SEADROP_ADDRESS)
+            .with_nonce(0);
+        assert!(
+            validate_signing_request(&config, wallet.address, &prepared, &otherwise_ready)
+                .unwrap_err()
+                .to_string()
+                .contains("estimation is still deferred")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ink_signing_budget_rechecks_replacement_fees_with_surcharges() {
+        use super::*;
+        let mut config = direct_config();
+        config.chain_id = crate::config::INK_MAINNET_CHAIN_ID;
+        config.gas.max_total_gas_cost_native = Some("0.0000000000000001".into());
+        let (rpc, server) =
+            crate::rpc::tests::mock_rpc(|request| match request["method"].as_str().unwrap() {
+                "eth_getBalance" => serde_json::json!("0x3e8"),
+                "eth_call" => serde_json::json!(format!("0x{:064x}", 5)),
+                _ => panic!("unexpected RPC method"),
+            })
+            .await;
+        let request = TransactionRequest::default()
+            .with_gas_limit(10)
+            .with_gas_price(1);
+        assert!(
+            validate_chain_fee_budget(&config, &rpc, Address::ZERO, &request)
+                .await
+                .is_ok()
+        );
+        let replacement = request.with_gas_price(9);
+        assert!(
+            validate_chain_fee_budget(&config, &rpc, Address::ZERO, &replacement)
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn extra_fees_are_included_in_both_cap_and_balance_checks() {
+        use super::*;
+        let mut config = opensea_config(true, None);
+        config.gas.max_total_gas_cost_native = Some("0.0000000000000001".into()); // 100 wei
+        assert!(
+            validate_budget_with_extra_fee(
+                &config,
+                U256::from(1000),
+                U256::ZERO,
+                10,
+                9,
+                U256::from(11)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_budget_with_extra_fee(
+                &config,
+                U256::from(1000),
+                U256::ZERO,
+                10,
+                9,
+                U256::from(10)
+            )
+            .is_ok()
+        );
+        config.gas.max_total_gas_cost_native = None;
+        assert!(
+            validate_budget_with_extra_fee(
+                &config,
+                U256::from(100),
+                U256::from(1),
+                10,
+                9,
+                U256::from(10)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_budget_with_extra_fee(&config, U256::MAX, U256::ZERO, 10, 9, U256::MAX)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stage_expiry_and_retries_use_chain_time_only() {
+        use super::*;
+        let stage = OpenSeaStage {
+            label: "public".into(),
+            start_time: 100,
+            end_time: Some(200),
+        };
+        assert_eq!(
+            unexpired_stages(vec![stage.clone()], 150),
+            vec![stage.clone()]
+        );
+        assert!(unexpired_stages(vec![stage], 201).is_empty());
+        assert_eq!(automatic_opensea_retry_timestamp(150, 5), 155);
+    }
+
     use super::{
         PreparedTransaction, automatic_opensea_retry_timestamp, ensure_opensea_supply,
         is_advanceable_opensea_rejection, is_aggressive_opensea, is_ambiguous_opensea_precondition,
@@ -2181,8 +2402,8 @@ mod tests {
 
     #[test]
     fn zero_delay_opensea_retry_is_ready_on_the_next_block() {
-        assert_eq!(automatic_opensea_retry_timestamp(0), 0);
-        assert!(automatic_opensea_retry_timestamp(2) >= 2);
+        assert_eq!(automatic_opensea_retry_timestamp(100, 0), 0);
+        assert_eq!(automatic_opensea_retry_timestamp(100, 2), 102);
     }
 
     #[test]

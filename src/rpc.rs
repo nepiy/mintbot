@@ -47,6 +47,68 @@ impl std::fmt::Debug for RpcClients {
 }
 
 impl RpcClients {
+    pub async fn latest_timestamp(&self) -> Result<u64> {
+        let blocks = self
+            .read_critical("eth_getBlockByNumber", |provider| async move {
+                provider
+                    .get_block_by_number(alloy::eips::BlockNumberOrTag::Latest)
+                    .await
+            })
+            .await?;
+        blocks
+            .into_iter()
+            .flatten()
+            .map(|block| block.header.timestamp)
+            .min()
+            .ok_or_else(|| BotError::Rpc("no provider returned a latest block timestamp".into()))
+    }
+
+    /// Conservative OP Stack surcharges at the current oracle state. Fail
+    /// closed if the oracle is unavailable or its ABI is unsupported.
+    pub async fn ink_extra_fee_reserve(&self, calldata_len: usize, gas_limit: u64) -> Result<U256> {
+        use alloy::{network::TransactionBuilder, primitives::address, sol_types::SolCall};
+        alloy::sol! {
+            function getL1FeeUpperBound(uint256 size) external view returns (uint256);
+            function getOperatorFee(uint256 gasUsed) external view returns (uint256);
+        }
+        // Legacy/type-2 requests without access lists have <256 bytes of RLP
+        // metadata, even at maximum field widths. Include signature overhead
+        // too; overestimating the unsigned size is intentionally conservative.
+        let size = calldata_len
+            .checked_add(256)
+            .ok_or_else(|| BotError::Transaction("transaction size overflowed".into()))?;
+        let oracle = address!("420000000000000000000000000000000000000F");
+        let call = |input: Vec<u8>| {
+            self.call_at(
+                TransactionRequest::default()
+                    .with_to(oracle)
+                    .with_input(input),
+                BlockId::latest(),
+            )
+        };
+        let (l1, operator) = tokio::try_join!(
+            call(
+                getL1FeeUpperBoundCall {
+                    size: U256::from(size)
+                }
+                .abi_encode()
+            ),
+            call(
+                getOperatorFeeCall {
+                    gasUsed: U256::from(gas_limit)
+                }
+                .abi_encode()
+            ),
+        )?;
+        let l1 = getL1FeeUpperBoundCall::abi_decode_returns(&l1)
+            .map_err(|_| BotError::Rpc("invalid Ink L1 fee oracle response".into()))?;
+        let operator = getOperatorFeeCall::abi_decode_returns(&operator)
+            .map_err(|_| BotError::Rpc("invalid Ink operator fee oracle response".into()))?;
+        l1.checked_add(operator)
+            .and_then(|fee| fee.checked_mul(U256::from(2)))
+            .ok_or_else(|| BotError::Transaction("Ink fee reserve overflowed".into()))
+    }
+
     pub async fn connect_from_env() -> Result<Self> {
         Self::connect_from_env_with_profile("").await
     }
@@ -748,8 +810,96 @@ pub async fn simulate_call(rpc: &RpcClients, tx: TransactionRequest) -> Result<(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    pub(crate) async fn mock_rpc(
+        response: fn(serde_json::Value) -> serde_json::Value,
+    ) -> (RpcClients, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(socket);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).await.unwrap();
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let result = response(request.clone());
+                let body =
+                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
+                        .to_string();
+                reader.get_mut().write_all(format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                ).as_bytes()).await.unwrap();
+            }
+        });
+        let provider = connect_http("test", &url).await.unwrap();
+        let endpoints = Arc::new(vec![("test".into(), provider.clone())]);
+        (
+            RpcClients {
+                http: provider.clone(),
+                ws: provider,
+                broadcast: endpoints.clone(),
+                read: endpoints,
+                ws_connect_latency: Duration::ZERO,
+                request_timeout: Duration::from_secs(1),
+                broadcast_timeout: Duration::from_secs(1),
+                ws_url: String::new(),
+            },
+            task,
+        )
+    }
+
+    #[tokio::test]
+    async fn ink_fee_reserve_includes_both_oracle_components() {
+        let (rpc, server) = mock_rpc(|request| {
+            assert_eq!(request["method"], "eth_call");
+            let tx = &request["params"][0];
+            let input = tx
+                .get("input")
+                .or_else(|| tx.get("data"))
+                .unwrap()
+                .as_str()
+                .unwrap();
+            let (expected_argument, amount) = if input.starts_with("0xf1c7a58b") {
+                (356, 100_u64)
+            } else {
+                assert!(input.starts_with("0x275aedd2"));
+                (200_000, 20_u64)
+            };
+            assert_eq!(
+                U256::from_str_radix(&input[10..], 16).unwrap(),
+                U256::from(expected_argument)
+            );
+            serde_json::json!(format!("0x{amount:064x}"))
+        })
+        .await;
+        assert_eq!(
+            rpc.ink_extra_fee_reserve(100, 200_000).await.unwrap(),
+            U256::from(240)
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ink_fee_reserve_fails_closed_on_missing_oracle() {
+        let (rpc, server) = mock_rpc(|_| serde_json::json!("0x")).await;
+        assert!(rpc.ink_extra_fee_reserve(100, 200_000).await.is_err());
+        server.abort();
+    }
 
     #[test]
     fn recognizes_known_transaction_responses() {

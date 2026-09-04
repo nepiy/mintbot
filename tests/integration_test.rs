@@ -59,3 +59,26 @@ async fn authenticated_manual_control_delivers_exactly_one_trigger() {
     assert_eq!(trigger, Some(()));
     cleanup_manual_control(&control_path);
 }
+
+#[tokio::test]
+async fn silent_client_cannot_block_an_authenticated_manual_trigger() {
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("manual.json");
+    std::fs::write(&config_path, "{}").unwrap();
+    let (mut receiver, control_path) = bind_manual_control(&config_path).await.unwrap();
+    let control: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&control_path).unwrap()).unwrap();
+    let port = control["port"].as_u64().unwrap() as u16;
+    let silent_client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    send_manual_trigger(&config_path).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("silent connection must time out"),
+        Some(())
+    );
+    drop(silent_client);
+    cleanup_manual_control(&control_path);
+}

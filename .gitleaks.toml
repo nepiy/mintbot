@@ -4,9 +4,5 @@ title = "mintbot secret scanning"
 useDefault = true
 
 [[allowlists]]
-description = "Fixed test-only signing key used by the no-broadcast local benchmark"
-paths = ['''^src/benchmark\.rs$''']
-
-[[allowlists]]
-description = "Local ignored secrets and generated build or Git object data"
-paths = ['''^\.env$''', '''^target/''', '''^\.git/''']
+description = "Generated build and Git object data only; never exclude secret files"
+paths = ['''^target/''', '''^\.git/''']

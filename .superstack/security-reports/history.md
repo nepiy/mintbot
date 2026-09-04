@@ -1,5 +1,12 @@
 # Security report history
 
+## 2026-09-04 — mintbot
+- Mode: Whole-code review remediation verification
+- Review issues addressed: 7; corrected: 6; mitigated with inclusion-time fee caveat: 1
+- Verification: 67 tests pass; formatting, Clippy, and redacted secret scans pass
+- Dependency audit: no known vulnerability advisories; 2 upstream maintenance warnings remain
+- Withdrawn dependency updated: chacha20 0.10.1 → 0.10.2
+
 ## 2026-08-22 — mintbot
 - Mode: Daily full-phase audit
 - Findings: 12 (C: 0, H: 1, M: 7, L: 4, I: 0)

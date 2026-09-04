@@ -14,4 +14,5 @@ Include the affected commit, reproduction steps using a test-only wallet, expect
 - Keep `.env` mode `0600` and never commit it.
 - Use encrypted `https://` and `wss://` RPC endpoints.
 - Set both mint-price and gas-cost caps.
+- Treat the gas-cost setting as a pre-broadcast budget. Ink includes buffered L1 data and operator fees and fails closed if its fee oracle cannot be read, but inclusion-time surcharges can still change. Other custom L2 surcharge models are not covered.
 - Verify the contract address, drop slug, quantity, and armed summary before leaving the bot unattended.

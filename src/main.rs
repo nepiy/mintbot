@@ -13,7 +13,14 @@ use std::path::Path;
 #[tokio::main]
 async fn main() -> Result<()> {
     verify_dotenv_permissions(Path::new(".env"))?;
-    dotenvy::dotenv().ok();
+    // Load exactly the file whose permissions were checked, never a parent's.
+    if let Err(error) = dotenvy::from_path(".env")
+        && !matches!(&error, dotenvy::Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Err(nft_mint_bot::error::BotError::Config(
+            "could not load .env; check its syntax and permissions".to_string(),
+        ));
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

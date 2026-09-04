@@ -350,13 +350,23 @@ pub async fn bind_manual_control(config_path: &Path) -> Result<(mpsc::Receiver<(
     let (sender, receiver) = mpsc::channel(1);
     tokio::spawn(async move {
         loop {
-            let Ok((socket, _)) = listener.accept().await else {
+            let accepted = tokio::select! {
+                _ = sender.closed() => break,
+                accepted = listener.accept() => accepted,
+            };
+            let Ok((socket, _)) = accepted else {
                 break;
             };
             let mut line = String::new();
             let mut reader = BufReader::new(socket).take(129);
-            if reader.read_line(&mut line).await.is_ok()
-                && line.len() <= 128
+            if matches!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    reader.read_line(&mut line),
+                )
+                .await,
+                Ok(Ok(_))
+            ) && line.len() <= 128
                 && line.trim_end() == format!("TRIGGER {token}")
             {
                 let _ = sender.send(()).await;
