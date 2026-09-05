@@ -1,6 +1,7 @@
 use crate::{
     config::{
-        GasConfig, HYPEREVM_DEFAULT_GAS_LIMIT, HYPEREVM_DEFAULT_MAX_GAS_COST_NATIVE,
+        ABSTRACT_DEFAULT_MAX_GAS_COST_NATIVE, ABSTRACT_MAINNET_CHAIN_ID, GasConfig,
+        HYPEREVM_DEFAULT_GAS_LIMIT, HYPEREVM_DEFAULT_MAX_GAS_COST_NATIVE,
         HYPEREVM_MAINNET_CHAIN_ID, INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE,
         INK_MAINNET_CHAIN_ID, MintCallConfig, MintConfig, MintTrigger, NonceStrategy,
         OpenSeaExecutionMode, ROBINHOOD_DEFAULT_GAS_LIMIT, ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
@@ -27,18 +28,42 @@ struct ManualControlInfo {
     token: String,
 }
 
-fn gas_defaults(chain_id: u64) -> (u64, &'static str) {
+fn gas_defaults(chain_id: u64) -> (Option<u64>, &'static str) {
     match chain_id {
-        INK_MAINNET_CHAIN_ID => (INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE),
+        // Abstract estimates include ZK execution and pubdata overhead. Do not
+        // reuse a fixed gas limit measured on another network.
+        ABSTRACT_MAINNET_CHAIN_ID => (None, ABSTRACT_DEFAULT_MAX_GAS_COST_NATIVE),
+        INK_MAINNET_CHAIN_ID => (Some(INK_DEFAULT_GAS_LIMIT), INK_DEFAULT_MAX_GAS_COST_NATIVE),
         HYPEREVM_MAINNET_CHAIN_ID => (
-            HYPEREVM_DEFAULT_GAS_LIMIT,
+            Some(HYPEREVM_DEFAULT_GAS_LIMIT),
             HYPEREVM_DEFAULT_MAX_GAS_COST_NATIVE,
         ),
         _ => (
-            ROBINHOOD_DEFAULT_GAS_LIMIT,
+            Some(ROBINHOOD_DEFAULT_GAS_LIMIT),
             ROBINHOOD_DEFAULT_MAX_GAS_COST_NATIVE,
         ),
     }
+}
+
+fn ask_abstract_gas_limit(required: bool) -> Result<Option<u64>> {
+    let prompt = if required {
+        "Tested Abstract gas limit (required for aggressive mode)"
+    } else {
+        "Tested Abstract gas limit (blank to estimate; closed sales may require a tested limit)"
+    };
+    let value = ask(prompt, "")?;
+    if value.trim().is_empty() && !required {
+        return Ok(None);
+    }
+    let limit = value.trim().parse::<u64>().map_err(|_| {
+        BotError::Config("Abstract gas limit must be a positive integer".to_string())
+    })?;
+    if limit == 0 {
+        return Err(BotError::Config(
+            "Abstract gas limit must be greater than zero".to_string(),
+        ));
+    }
+    Ok(Some(limit))
 }
 
 pub fn run_wizard(output: &Path) -> Result<PathBuf> {
@@ -73,15 +98,17 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         (chain_id, None)
     } else {
         println!(
-            "Select network:\n1. Robinhood Chain mainnet\n2. Ink mainnet\n3. HyperEVM mainnet"
+            "Select network:\n1. Robinhood Chain mainnet\n2. Ink mainnet\n3. HyperEVM mainnet\n4. Abstract mainnet"
         );
         match ask("Network", "1")?.trim() {
             "1" => (ROBINHOOD_MAINNET_CHAIN_ID, Some("Robinhood Chain mainnet")),
             "2" => (INK_MAINNET_CHAIN_ID, Some("Ink mainnet")),
             "3" => (HYPEREVM_MAINNET_CHAIN_ID, Some("HyperEVM mainnet")),
+            "4" => (ABSTRACT_MAINNET_CHAIN_ID, Some("Abstract mainnet")),
             _ => {
                 return Err(BotError::Config(
-                    "network must be 1 (Robinhood), 2 (Ink), or 3 (HyperEVM)".to_string(),
+                    "network must be 1 (Robinhood), 2 (Ink), 3 (HyperEVM), or 4 (Abstract)"
+                        .to_string(),
                 ));
             }
         }
@@ -95,6 +122,8 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
             "Ink NFT".to_string()
         } else if chain_id == HYPEREVM_MAINNET_CHAIN_ID {
             "HyperEVM NFT".to_string()
+        } else if chain_id == ABSTRACT_MAINNET_CHAIN_ID {
+            "Abstract NFT".to_string()
         } else {
             "Robinhood NFT".to_string()
         }
@@ -156,6 +185,13 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
                 ));
             }
         };
+        let gas_limit = if chain_id == ABSTRACT_MAINNET_CHAIN_ID
+            && matches!(opensea_execution_mode, OpenSeaExecutionMode::Aggressive)
+        {
+            ask_abstract_gas_limit(true)?
+        } else {
+            default_gas_limit
+        };
         let config = MintConfig {
             name,
             chain_id,
@@ -181,7 +217,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
                 timestamp: 0,
             },
             gas: GasConfig {
-                gas_limit: Some(default_gas_limit),
+                gas_limit,
                 max_total_gas_cost_native: Some(default_max_gas_cost_native.to_string()),
                 ..GasConfig::default()
             },
@@ -243,16 +279,21 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
                 .collect(),
         )
     };
-    let gas_limit = if allow_manual {
-        ask(
-            "Prepared gas limit (required when a closed sale makes estimation revert)",
-            &default_gas_limit.to_string(),
-        )?
-        .parse::<u64>()
-        .map_err(|err| BotError::Config(format!("invalid gas limit: {err}")))?
+    let gas_limit = if chain_id == ABSTRACT_MAINNET_CHAIN_ID {
+        ask_abstract_gas_limit(false)?
+    } else if allow_manual {
+        Some(
+            ask(
+                "Prepared gas limit (required when a closed sale makes estimation revert)",
+                &default_gas_limit.unwrap_or_default().to_string(),
+            )?
+            .parse::<u64>()
+            .map_err(|err| BotError::Config(format!("invalid gas limit: {err}")))?,
+        )
     } else {
         println!(
-            "Gas limit: {default_gas_limit} (automatic default; advanced config can override)"
+            "Gas limit: {} (automatic default; advanced config can override)",
+            default_gas_limit.unwrap_or_default()
         );
         default_gas_limit
     };
@@ -314,7 +355,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         },
         trigger,
         gas: GasConfig {
-            gas_limit: Some(gas_limit),
+            gas_limit,
             max_total_gas_cost_native: (!allow_manual)
                 .then(|| default_max_gas_cost_native.to_string()),
             ..GasConfig::default()

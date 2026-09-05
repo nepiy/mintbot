@@ -2276,6 +2276,89 @@ mod latency_tests;
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn abstract_opensea_estimates_real_calldata_and_signs_for_abstract() {
+        use super::*;
+        use crate::opensea::SeaDropMint;
+        use alloy::{consensus::Transaction, sol_types::SolCall};
+
+        let mut config = opensea_config(true, None);
+        config.chain_id = crate::config::ABSTRACT_MAINNET_CHAIN_ID;
+        config.gas.mode = GasMode::Eip1559;
+        config.gas.max_fee_gwei = Some("0.1".into());
+        config.gas.max_priority_fee_gwei = Some("0".into());
+        config.gas.max_total_gas_cost_native = Some("0.001".into());
+        config.nonce_strategy = NonceStrategy::JustBeforeTrigger;
+        config.validate().unwrap();
+        let signer: alloy::signers::local::PrivateKeySigner =
+            format!("{:064x}", 1).parse().unwrap();
+        let wallet = LoadedWallet {
+            address: signer.address(),
+            wallet: alloy::network::EthereumWallet::new(signer),
+        };
+        let calldata = SeaDropMint::mintPublicCall {
+            nftContract: config.contract().unwrap(),
+            feeRecipient: Address::ZERO,
+            minterIfNotPayer: wallet.address,
+            quantity: U256::from(config.quantity),
+        }
+        .abi_encode();
+        let expected_calldata = format!("0x{}", hex::encode(&calldata));
+        let (rpc, server) = crate::rpc::tests::mock_rpc_async(move |request| {
+            let expected_calldata = expected_calldata.clone();
+            async move {
+                match request["method"].as_str().unwrap() {
+                    "eth_getBalance" => serde_json::json!("0xde0b6b3a7640000"),
+                    "eth_estimateGas" => {
+                        let tx = &request["params"][0];
+                        assert_eq!(tx["chainId"], "0xab5");
+                        assert_eq!(tx["to"], format!("{OPENSEA_SEADROP_ADDRESS:#x}"));
+                        assert_eq!(
+                            tx.get("input").or_else(|| tx.get("data")).unwrap(),
+                            &expected_calldata
+                        );
+                        // ZK overhead can exceed the other networks' fixed limits.
+                        serde_json::json!("0x16e360")
+                    }
+                    method => panic!("unexpected RPC method: {method}"),
+                }
+            }
+        })
+        .await;
+        let mut prepared = prepare_transaction(&config, &rpc, &wallet).await.unwrap();
+        assert_eq!(prepared.gas_limit, 0);
+        apply_opensea_inputs(
+            &config,
+            &rpc,
+            &wallet,
+            &mut prepared,
+            OpenSeaInputs {
+                mint: OpenSeaMintTransaction {
+                    target: OPENSEA_SEADROP_ADDRESS,
+                    calldata,
+                    value: U256::ZERO,
+                },
+                fees: None,
+                balance: Some(U256::from(1_000_000_000_000_000_000u64)),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(prepared.gas_limit, 1_725_000);
+        prepared.request.set_nonce(0);
+        validate_signing_request(&config, wallet.address, &prepared, &prepared.request).unwrap();
+        let signed = wallet.sign_request(prepared.request.clone()).await.unwrap();
+        assert_eq!(signed.chain_id(), Some(2741));
+        assert!(signed.is_eip1559());
+        // The same gas estimate must still respect the configured ETH budget.
+        config.gas.max_total_gas_cost_native = Some("0.00001".into());
+        assert!(
+            validate_signing_request(&config, wallet.address, &prepared, &prepared.request)
+                .is_err()
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn normal_opensea_defers_placeholder_estimation_and_cannot_sign_it() {
         use super::*;
         let mut config = opensea_config(true, None);

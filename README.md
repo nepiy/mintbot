@@ -9,6 +9,7 @@ The interactive launcher supports:
 - Robinhood Chain mainnet — chain ID `4663`
 - Ink mainnet — chain ID `57073`
 - HyperEVM mainnet — chain ID `999` (native gas token: HYPE)
+- Abstract mainnet — chain ID `2741` (native gas token: ETH)
 
 Advanced JSON configurations can target other EVM-compatible networks by providing the correct chain ID, RPC endpoints, contract address, mint ABI, and trigger.
 
@@ -245,12 +246,38 @@ The interactive launcher supports these profiles:
 | Robinhood Chain mainnet | `4663` | `ROBINHOOD_HTTP_RPC_URL`, `ROBINHOOD_WS_RPC_URL` |
 | Ink mainnet | `57073` | `INK_HTTP_RPC_URL`, `INK_WS_RPC_URL` |
 | HyperEVM mainnet | `999` | `HYPEREVM_HTTP_RPC_URL`, `HYPEREVM_WS_RPC_URL` |
+| Abstract mainnet | `2741` | `ABSTRACT_HTTP_RPC_URL`, `ABSTRACT_WS_RPC_URL` |
 
 If either network-specific HTTP or WebSocket variable is filled, that profile is selected and both values must be valid. If a selected network has no profile values, the bot falls back to `HTTP_RPC_URL` and `WS_RPC_URL`.
 
 The included `.env.example` contains Ink’s public HTTPS and WebSocket endpoints. Replace them with dedicated endpoints when reliability matters. See [Ink RPC documentation](https://docs.inkonchain.com/tools/rpc).
 
 For HyperEVM, the official HTTPS endpoint is `https://rpc.hyperliquid.xyz/evm` and HYPE is the native gas token. Hyperliquid’s official endpoint does not provide WebSocket JSON-RPC, so configure `HYPEREVM_WS_RPC_URL` with a WSS-capable HyperEVM provider for block monitoring. Keep `HYPEREVM_HTTP_RPC_URL` and any backup/broadcast URLs on HyperEVM. See [Hyperliquid HyperEVM documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm).
+
+For Abstract, use `https://api.mainnet.abs.xyz` and `wss://api.mainnet.abs.xyz/ws`, included in `.env.example`. See [Abstract network details](https://docs.abs.xyz/connect-to-abstract). Add the `ABSTRACT_` profile to an existing `.env` to keep using your Robinhood endpoints when you switch back. The bot signs with the EOA derived from `PRIVATE_KEY`; fund that address with ETH on Abstract. Abstract Global Wallet smart accounts, session keys, and paymasters are not supported by this signer.
+
+### Abstract quick start
+
+Add these lines to your existing `.env`:
+
+```dotenv
+ABSTRACT_HTTP_RPC_URL=https://api.mainnet.abs.xyz
+ABSTRACT_WS_RPC_URL=wss://api.mainnet.abs.xyz/ws
+ABSTRACT_BACKUP_RPC_URL=
+ABSTRACT_BROADCAST_RPC_URLS=
+```
+
+Build and check the Abstract RPC profile, then launch a dry run:
+
+```bash
+cargo +1.94.1 build --release --locked
+./target/release/nft-mint-bot rpc-test --chain-id 2741
+./target/release/nft-mint-bot start --dry-run
+```
+
+Choose network **4 — Abstract mainnet**, enter the collection contract and OpenSea drop slug as usual, and choose **normal**. For live minting, run `./target/release/nft-mint-bot` and choose **4** again. On Windows use `.\target\release\nft-mint-bot.exe`.
+
+Normal OpenSea mode estimates the actual mint transaction's gas once the stage is eligible. Abstract has no fixed gas default copied from another chain: its [gas estimate includes transaction overhead](https://docs.abs.xyz/how-abstract-works/evm-differences/gas-fees). Aggressive mode asks for a positive, tested Abstract gas limit. Direct mint mode accepts a tested limit or a blank value to estimate before arming; if a closed sale prevents estimation, supply a limit from a trusted prior simulation. The interactive gas-cost budget defaults to `0.001` ETH; advanced JSON configuration can change it.
 
 ### Step 7 — Obtain an OpenSea API key if needed
 
@@ -324,6 +351,10 @@ HYPEREVM_HTTP_RPC_URL=https://rpc.hyperliquid.xyz/evm
 HYPEREVM_WS_RPC_URL=wss://your-hyperevm-websocket-rpc.example
 HYPEREVM_BACKUP_RPC_URL=
 HYPEREVM_BROADCAST_RPC_URLS=
+ABSTRACT_HTTP_RPC_URL=https://api.mainnet.abs.xyz
+ABSTRACT_WS_RPC_URL=wss://api.mainnet.abs.xyz/ws
+ABSTRACT_BACKUP_RPC_URL=
+ABSTRACT_BROADCAST_RPC_URLS=
 ```
 
 Environment-variable rules:
@@ -412,12 +443,13 @@ Windows PowerShell:
 
 Answer the prompts in this order:
 
-1. Network: `1` for Robinhood Chain mainnet or `2` for Ink mainnet.
+1. Network: `1` for Robinhood Chain, `2` for Ink, `3` for HyperEVM, or `4` for Abstract mainnet.
 2. Collection contract address.
 3. OpenSea drop slug.
 4. Quantity.
 5. `yes` for a free-mint guard, or `no` plus the maximum price per NFT.
 6. Execution mode: choose `normal` unless you have deliberately configured and tested `aggressive` mode.
+7. On Abstract, aggressive mode also requires a tested gas limit.
 
 Use **free-mint = yes** only when the intended stage should send exactly `0` native currency. The guard rejects any nonzero value returned by OpenSea; it does not make gas free. Use **free-mint = no** for a paid stage and enter the maximum price for one NFT, not the total. The bot multiplies that cap by quantity and refuses to sign if OpenSea returns more.
 
