@@ -7,8 +7,8 @@ use crate::{
     error::{BotError, Result},
     metrics::LatencyMetrics,
     opensea::{
-        OPENSEA_SEADROP_ADDRESS, OpenSeaClient, OpenSeaDrop, OpenSeaStage, spawn_schedule_refresh,
-        validate_seadrop_calldata,
+        OPENSEA_SEADROP_ADDRESS, OpenSeaClient, OpenSeaDrop, OpenSeaMintTransaction, OpenSeaStage,
+        spawn_schedule_refresh, validate_seadrop_calldata,
     },
     rpc::{RpcClients, simulate_call},
     security::validate_direct_mint_function,
@@ -19,13 +19,13 @@ use crate::{
 };
 use alloy::{
     consensus::BlockHeader,
-    eips::{BlockId, Encodable2718},
+    eips::{BlockId, Encodable2718, eip1559::Eip1559Estimation},
     network::TransactionBuilder,
     primitives::{Address, B256, TxKind, U256},
     pubsub::SubscriptionStream,
     rpc::types::{Filter, Header, Log, TransactionRequest},
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt, future::BoxFuture};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -183,6 +183,8 @@ async fn run_bot_with_config(
         state: &state,
         dry_run,
         dynamic_fields_healthy: true,
+        armed_refresh: None,
+        nonce_lock: None,
         last_seen_block,
         last_chain_timestamp,
         last_closed_retry_notice: None,
@@ -430,10 +432,28 @@ async fn hydrate_opensea_transaction_with_client(
     let Some(drop_slug) = config.opensea_drop_slug.as_deref() else {
         return Ok(());
     };
-    // These requests do not depend on one another. Overlap them so the
-    // trigger path pays for the slower of the OpenSea request and the fee
-    // estimate, rather than their sum.
-    let build_mint = client.build_mint_with_retry(drop_slug, wallet.address, config.quantity);
+    let inputs = fetch_opensea_inputs(
+        config,
+        rpc,
+        wallet.address,
+        client.build_mint_with_retry(drop_slug, wallet.address, config.quantity),
+    )
+    .await?;
+    apply_opensea_inputs(config, rpc, wallet, prepared, inputs).await
+}
+
+struct OpenSeaInputs {
+    mint: OpenSeaMintTransaction,
+    fees: Option<Eip1559Estimation>,
+    balance: Option<U256>,
+}
+
+async fn fetch_opensea_inputs(
+    config: &MintConfig,
+    rpc: &RpcClients,
+    wallet: Address,
+    build_mint: impl std::future::Future<Output = Result<OpenSeaMintTransaction>>,
+) -> Result<OpenSeaInputs> {
     let estimate_fees = async {
         if matches!(config.gas.mode, GasMode::Auto) && !is_aggressive_opensea(config) {
             let mut estimation = rpc.estimate_eip1559_fees().await?;
@@ -446,7 +466,35 @@ async fn hydrate_opensea_transaction_with_client(
             Ok(None)
         }
     };
-    let (mint, current_fees) = tokio::try_join!(build_mint, estimate_fees)?;
+    let balance = async {
+        if is_aggressive_opensea(config) {
+            Ok(None)
+        } else {
+            rpc.check_balance(wallet).await.map(Some)
+        }
+    };
+    // Balance is independent of calldata and gas. Start all three reads at
+    // the trigger, then validate the exact final payment and gas below.
+    let (mint, fees, balance) = tokio::try_join!(build_mint, estimate_fees, balance)?;
+    Ok(OpenSeaInputs {
+        mint,
+        fees,
+        balance,
+    })
+}
+
+async fn apply_opensea_inputs(
+    config: &MintConfig,
+    rpc: &RpcClients,
+    wallet: &LoadedWallet,
+    prepared: &mut PreparedTransaction,
+    inputs: OpenSeaInputs,
+) -> Result<()> {
+    let OpenSeaInputs {
+        mint,
+        fees: current_fees,
+        balance,
+    } = inputs;
     if mint.target != OPENSEA_SEADROP_ADDRESS {
         return Err(BotError::Transaction(format!(
             "OpenSea returned unsupported transaction target {}; expected the canonical SeaDrop contract {}",
@@ -510,19 +558,14 @@ async fn hydrate_opensea_transaction_with_client(
         select_opensea_gas_limit(estimated_gas, config.gas.gas_limit, config.gas.multiplier)?
     };
     request.set_gas_limit(gas_limit);
-    let available_balance = if is_aggressive_opensea(config) {
-        validate_transaction_budget_with_balance(
-            config,
-            prepared.available_balance,
-            mint.value,
-            gas_limit,
-            fee_cap,
-        )?;
-        prepared.available_balance
-    } else {
-        validate_transaction_budget(config, rpc, wallet.address, mint.value, gas_limit, fee_cap)
-            .await?
-    };
+    let available_balance = balance.unwrap_or(prepared.available_balance);
+    validate_transaction_budget_with_balance(
+        config,
+        available_balance,
+        mint.value,
+        gas_limit,
+        fee_cap,
+    )?;
     prepared.request = request;
     prepared.calldata = mint.calldata;
     prepared.mint_value = mint.value;
@@ -653,6 +696,8 @@ struct MonitorContext<'a> {
     state: &'a AtomicBotState,
     dry_run: bool,
     dynamic_fields_healthy: bool,
+    armed_refresh: Option<BoxFuture<'static, Result<PreparedTransaction>>>,
+    nonce_lock: Option<WalletNonceLock>,
     last_seen_block: Option<u64>,
     last_chain_timestamp: u64,
     last_closed_retry_notice: Option<Instant>,
@@ -770,17 +815,12 @@ async fn monitor_until_trigger(
                 };
                 if let Some(received) = backfill_ready
                     && backfill_can_execute
-                    && context.state.try_acquire_trigger()
+                    && context.acquire_trigger()
                 {
                     let validated = Instant::now();
                     let acquired = Instant::now();
                     execute_transaction(
-                        context.config,
-                        context.rpc,
-                        context.wallet,
-                        context.prepared,
-                        context.state,
-                        context.dry_run,
+                        context,
                         TriggerTiming {
                             received,
                             validated,
@@ -814,13 +854,18 @@ struct TriggerTiming {
 
 async fn monitor_block_stream(
     context: &mut MonitorContext<'_>,
-    blocks: &mut SubscriptionStream<Header>,
+    blocks: &mut (impl futures_util::Stream<Item = Header> + Unpin),
 ) -> std::result::Result<MonitorOutcome, MonitorFailure> {
     let mut shutdown = Box::pin(shutdown_signal());
     println!("\nMonitoring: every new block via WebSocket");
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(MonitorOutcome::Shutdown),
+            result = async { context.armed_refresh.as_mut().expect("refresh present").await },
+                if context.armed_refresh.is_some() => {
+                    context.finish_armed_refresh(result);
+                }
+
             header = blocks.next() => {
                 let received = Instant::now();
                 let Some(header) = header else {
@@ -845,17 +890,12 @@ async fn monitor_block_stream(
                         }
                         {
                             let validated = Instant::now();
-                            if !context.state.try_acquire_trigger() {
+                            if !context.acquire_trigger() {
                                 continue;
                             }
                             let acquired = Instant::now();
                             return execute_transaction(
-                                context.config,
-                                context.rpc,
-                                context.wallet,
-                                context.prepared,
-                                context.state,
-                                context.dry_run,
+                                context,
                                 TriggerTiming {
                                     received,
                                     validated,
@@ -868,11 +908,11 @@ async fn monitor_block_stream(
                     }
                     Ok(TriggerObservation::NotReady) => {
                         tracing::debug!(block = number, "mint trigger not ready");
-                        refresh_armed_fields(context).await;
+                        context.start_armed_refresh();
                     }
                     Err(err) => {
                         tracing::warn!(block = number, error = %err, "trigger evaluation failed; waiting for the next block");
-                        refresh_armed_fields(context).await;
+                        context.start_armed_refresh();
                     }
                 }
             }
@@ -894,6 +934,11 @@ async fn monitor_event_stream(
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(MonitorOutcome::Shutdown),
+            result = async { context.armed_refresh.as_mut().expect("refresh present").await },
+                if context.armed_refresh.is_some() => {
+                    context.finish_armed_refresh(result);
+                }
+
             header = blocks.next() => {
                 let received = Instant::now();
                 let Some(header) = header else {
@@ -920,17 +965,12 @@ async fn monitor_event_stream(
                         }
                         {
                             let validated = Instant::now();
-                            if !context.state.try_acquire_trigger() {
+                            if !context.acquire_trigger() {
                                 continue;
                             }
                             let acquired = Instant::now();
                             return execute_transaction(
-                                context.config,
-                                context.rpc,
-                                context.wallet,
-                                context.prepared,
-                                context.state,
-                                context.dry_run,
+                                context,
                                 TriggerTiming {
                                     received,
                                     validated,
@@ -941,10 +981,10 @@ async fn monitor_event_stream(
                             .map_err(MonitorFailure::Execution);
                         }
                     }
-                    Ok(TriggerObservation::NotReady) => refresh_armed_fields(context).await,
+                    Ok(TriggerObservation::NotReady) => context.start_armed_refresh(),
                     Err(err) => {
                         tracing::warn!(error = %err, "event confirmation evaluation failed");
-                        refresh_armed_fields(context).await;
+                        context.start_armed_refresh();
                     }
                 }
             }
@@ -972,17 +1012,12 @@ async fn monitor_event_stream(
                 }
                 {
                     let validated = Instant::now();
-                    if !context.state.try_acquire_trigger() {
+                    if !context.acquire_trigger() {
                         continue;
                     }
                     let acquired = Instant::now();
                     return execute_transaction(
-                        context.config,
-                        context.rpc,
-                        context.wallet,
-                        context.prepared,
-                        context.state,
-                        context.dry_run,
+                        context,
                         TriggerTiming {
                             received,
                             validated,
@@ -1028,15 +1063,10 @@ async fn monitor_manual(
                 Err(err) => return Err(MonitorFailure::Execution(err)),
             }
             let validated = Instant::now();
-            if context.state.try_acquire_trigger() {
+            if context.acquire_trigger() {
                 let acquired = Instant::now();
                 execute_transaction(
-                    context.config,
-                    context.rpc,
-                    context.wallet,
-                    context.prepared,
-                    context.state,
-                    context.dry_run,
+                    context,
                     TriggerTiming {
                         received,
                         validated,
@@ -1113,7 +1143,7 @@ async fn refresh_armed_fields(context: &mut MonitorContext<'_>) {
     match refresh_transaction_fields(
         context.config,
         context.rpc,
-        context.wallet,
+        context.wallet.address,
         context.prepared,
     )
     .await
@@ -1127,6 +1157,13 @@ async fn refresh_armed_fields(context: &mut MonitorContext<'_>) {
 }
 
 async fn ensure_dynamic_fields(context: &mut MonitorContext<'_>) -> bool {
+    if let Some(refresh) = context.armed_refresh.take() {
+        // If the concurrent OpenSea request fails and cancels this await,
+        // require another successful refresh before cached fields are used.
+        context.dynamic_fields_healthy = false;
+        let result = refresh.await;
+        context.finish_armed_refresh(result);
+    }
     if context.dynamic_fields_healthy {
         return true;
     }
@@ -1135,21 +1172,66 @@ async fn ensure_dynamic_fields(context: &mut MonitorContext<'_>) -> bool {
 }
 
 async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bool> {
-    if !ensure_dynamic_fields(context).await {
-        return Ok(false);
+    if context.dry_run {
+        return prepare_trigger_transaction(context).await;
     }
+    // Hold the same cross-process lock through preparation, signing and RPC
+    // acknowledgement. The pending nonce can now overlap preflight/OpenSea
+    // instead of adding another round trip after they finish.
+    let lock = WalletNonceLock::acquire(context.config.chain_id, context.wallet.address).await?;
+    let rpc = context.rpc.clone();
+    let wallet = context.wallet.address;
+    let refresh_nonce = context.prepared.force_nonce_refresh
+        || !uses_cached_nonce(context.config)
+        || lock.was_contended();
+    let nonce = async {
+        if refresh_nonce {
+            rpc.preload_nonce(wallet).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    };
+    let (ready, nonce) = tokio::try_join!(prepare_trigger_transaction(context), nonce)?;
+    if ready {
+        if let Some(nonce) = nonce {
+            context.prepared.request.set_nonce(nonce);
+        }
+        context.prepared.force_nonce_refresh = false;
+        context.nonce_lock = Some(lock);
+    }
+    Ok(ready)
+}
+
+async fn prepare_trigger_transaction(context: &mut MonitorContext<'_>) -> Result<bool> {
     if context.config.opensea_drop_slug.is_some() && !context.prepared.opensea_hydrated {
         let client = context
             .opensea_client
             .ok_or_else(|| BotError::Config("OpenSea client was not initialized".to_string()))?;
-        let hydration = hydrate_opensea_transaction_with_client(
-            context.config,
-            context.rpc,
-            context.wallet,
-            context.prepared,
-            client,
-        )
+        let config = context.config;
+        let rpc = context.rpc.clone();
+        let wallet = context.wallet;
+        let build_mint = client.build_mint_with_retry(
+            config
+                .opensea_drop_slug
+                .as_deref()
+                .expect("OpenSea slug checked"),
+            wallet.address,
+            config.quantity,
+        );
+        let hydration = async {
+            // Aggressive mode may have a refresh in flight when the stage
+            // opens. Keep consuming block/log notifications while it runs,
+            // and overlap its completion with the fresh OpenSea request.
+            let Some(inputs) = fetch_trigger_opensea_inputs(context, build_mint).await? else {
+                return Ok(false);
+            };
+            apply_opensea_inputs(config, &rpc, wallet, context.prepared, inputs).await?;
+            Ok(true)
+        }
         .await;
+        if matches!(hydration, Ok(false)) {
+            return Ok(false);
+        }
         if let Err(err) = hydration {
             let stage_unavailable = matches!(
                 &err,
@@ -1205,6 +1287,8 @@ async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bo
             }
             return Err(err);
         }
+    } else if !ensure_dynamic_fields(context).await {
+        return Ok(false);
     }
 
     // Direct contract mints can be armed before the sale opens. A timestamp
@@ -1242,7 +1326,69 @@ async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bo
     Ok(true)
 }
 
+async fn fetch_trigger_opensea_inputs(
+    context: &mut MonitorContext<'_>,
+    build_mint: impl std::future::Future<Output = Result<OpenSeaMintTransaction>>,
+) -> Result<Option<OpenSeaInputs>> {
+    let rpc = context.rpc.clone();
+    let inputs = fetch_opensea_inputs(context.config, &rpc, context.wallet.address, build_mint);
+    let (inputs, healthy) =
+        tokio::try_join!(inputs, async { Ok(ensure_dynamic_fields(context).await) })?;
+    Ok(healthy.then_some(inputs))
+}
+
 impl MonitorContext<'_> {
+    fn acquire_trigger(&mut self) -> bool {
+        let acquired = self.state.try_acquire_trigger();
+        if !acquired {
+            self.nonce_lock = None;
+        }
+        acquired
+    }
+
+    fn start_armed_refresh(&mut self) {
+        if self.armed_refresh.is_some()
+            || (self.config.opensea_drop_slug.is_some() && !is_aggressive_opensea(self.config))
+        {
+            return;
+        }
+        let config = self.config.clone();
+        let rpc = self.rpc.clone();
+        let wallet = self.wallet.address;
+        let mut prepared = self.prepared.clone();
+        // One owned future, polled by the monitor's select loop. Fast blocks
+        // coalesce instead of spawning unbounded RPC work or queuing behind it.
+        self.armed_refresh = Some(
+            async move {
+                refresh_transaction_fields(&config, &rpc, wallet, &mut prepared).await?;
+                Ok(prepared)
+            }
+            .boxed(),
+        );
+    }
+
+    fn finish_armed_refresh(&mut self, result: Result<PreparedTransaction>) {
+        self.armed_refresh = None;
+        match result {
+            Ok(prepared) => {
+                // A schedule update can invalidate hydrated calldata while
+                // the refresh is in flight. Merge dynamic fields only; never
+                // restore an old stage, payment, or retry flag from its snapshot.
+                self.prepared.request.nonce = prepared.request.nonce;
+                self.prepared.request.max_fee_per_gas = prepared.request.max_fee_per_gas;
+                self.prepared.request.max_priority_fee_per_gas =
+                    prepared.request.max_priority_fee_per_gas;
+                self.prepared.fee_cap = prepared.fee_cap;
+                self.prepared.available_balance = prepared.available_balance;
+                self.dynamic_fields_healthy = true;
+            }
+            Err(error) => {
+                self.dynamic_fields_healthy = false;
+                tracing::warn!(error = %error, "could not refresh armed transaction fields");
+            }
+        }
+    }
+
     fn defer_automatic_opensea_retry(&mut self, delay_seconds: u64) -> Result<()> {
         if !self.auto_opensea_schedule {
             return Ok(());
@@ -1499,11 +1645,11 @@ fn automatic_opensea_retry_timestamp(chain_timestamp: u64, delay_seconds: u64) -
 async fn refresh_transaction_fields(
     config: &MintConfig,
     rpc: &RpcClients,
-    wallet: &LoadedWallet,
+    wallet: Address,
     prepared: &mut PreparedTransaction,
 ) -> Result<()> {
     // Normal OpenSea mode deliberately obtains fresh fees, gas, balance, and
-    // nonce after OpenSea returns the final calldata. Refreshing those same
+    // nonce during trigger preparation. Refreshing those same
     // fields on every waiting block only consumes RPC quota and can turn an
     // irrelevant transient read failure into trigger-path latency.
     if config.opensea_drop_slug.is_some() && !is_aggressive_opensea(config) {
@@ -1513,7 +1659,7 @@ async fn refresh_transaction_fields(
         || is_aggressive_opensea(config);
     let nonce = async {
         if refresh_nonce {
-            Ok(Some(rpc.preload_nonce(wallet.address).await?))
+            Ok(Some(rpc.preload_nonce(wallet).await?))
         } else {
             Ok(None)
         }
@@ -1530,7 +1676,7 @@ async fn refresh_transaction_fields(
             Ok(None)
         }
     };
-    let (nonce, fees, balance) = tokio::try_join!(nonce, fees, rpc.check_balance(wallet.address))?;
+    let (nonce, fees, balance) = tokio::try_join!(nonce, fees, rpc.check_balance(wallet))?;
     if let Some(nonce) = nonce {
         prepared.request.set_nonce(nonce);
     }
@@ -1555,19 +1701,19 @@ async fn refresh_transaction_fields(
 }
 
 async fn execute_transaction(
-    config: &MintConfig,
-    rpc: &RpcClients,
-    wallet: &LoadedWallet,
-    prepared: &mut PreparedTransaction,
-    state: &AtomicBotState,
-    dry_run: bool,
+    context: &mut MonitorContext<'_>,
     timing: TriggerTiming,
 ) -> Result<MonitorOutcome> {
+    let config = context.config;
+    let rpc = &*context.rpc;
+    let wallet = context.wallet;
+    let prepared = &mut *context.prepared;
+    let state = context.state;
     let mut metrics = LatencyMetrics::new(timing.received);
     metrics.trigger_evaluation_started = timing.received;
     metrics.trigger_validated = timing.validated;
     metrics.trigger_acquired = timing.acquired;
-    if dry_run {
+    if context.dry_run {
         println!("\nTRIGGER DETECTED");
         println!("\nDry-run enabled.\nTransaction NOT submitted.");
         state.store(BotState::Stopped);
@@ -1575,29 +1721,24 @@ async fn execute_transaction(
         return Ok(MonitorOutcome::Done);
     }
 
-    if config.opensea_drop_slug.is_some() && !prepared.opensea_hydrated {
-        hydrate_opensea_transaction(config, rpc, wallet, prepared).await?;
-    }
-
-    // A configured bytecode pin is intentionally rechecked on the critical
-    // path. Without this final read, a target could change after startup but
-    // before the bot signs.
-    if config.expected_contract_code_hash.is_some() {
-        rpc.validate_contract(config).await?;
-    }
-
     metrics.finalization_started = Some(Instant::now());
-    let nonce_lock = WalletNonceLock::acquire(config.chain_id, wallet.address).await?;
-    let mut request = prepared.request.clone();
-    if prepared.force_nonce_refresh || !uses_cached_nonce(config) || nonce_lock.was_contended() {
-        // A cached nonce is no longer trustworthy after waiting for another
-        // bot process using the same wallet to release its cross-process lock.
-        request.set_nonce(rpc.preload_nonce(wallet.address).await?);
-        prepared.force_nonce_refresh = false;
-    }
-    metrics.finalization_completed = Some(Instant::now());
+    let nonce_lock = context.nonce_lock.take().ok_or_else(|| {
+        signing_policy_error("transaction was not prepared under the wallet nonce lock")
+    })?;
+    let request = prepared.request.clone();
+    // Both checks still finish immediately before signing, including Ink's
+    // live balance/oracle reads. Neither depends on the other's response.
+    tokio::try_join!(
+        async {
+            if config.expected_contract_code_hash.is_some() {
+                rpc.validate_contract(config).await?;
+            }
+            Ok(())
+        },
+        validate_chain_fee_budget(config, rpc, wallet.address, &request),
+    )?;
     validate_signing_request(config, wallet.address, prepared, &request)?;
-    validate_chain_fee_budget(config, rpc, wallet.address, &request).await?;
+    metrics.finalization_completed = Some(Instant::now());
     state.store(BotState::Signing);
     metrics.signing_started = Some(Instant::now());
     let signed = wallet.sign_request(request.clone()).await?;
@@ -1622,6 +1763,7 @@ async fn execute_transaction(
         rpc_elapsed.as_secs_f64() * 1000.0
     );
     println!("Waiting for receipt...");
+    metrics.print();
     let outcome = monitor_receipt(config, rpc, wallet, prepared, request, hash, state).await?;
     if matches!(outcome, MonitorOutcome::Retry) {
         // A mined/reverted attempt has consumed its nonce even though it did
@@ -1629,7 +1771,6 @@ async fn execute_transaction(
         // this matters for the preloaded strategy used by the wizard.
         prepared.force_nonce_refresh = true;
     }
-    metrics.print();
     Ok(outcome)
 }
 
@@ -2127,6 +2268,10 @@ async fn shutdown_signal() {
         let _ = tokio::signal::ctrl_c().await;
     }
 }
+
+#[cfg(test)]
+#[path = "bot_latency_tests.rs"]
+mod latency_tests;
 
 #[cfg(test)]
 mod tests {

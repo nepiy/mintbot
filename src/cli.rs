@@ -18,7 +18,11 @@ pub enum Command {
         #[arg(long, default_value = "configs")]
         output: PathBuf,
     },
-    RpcTest,
+    RpcTest {
+        /// Benchmark the same network-specific RPC profile used by a mint.
+        #[arg(long)]
+        chain_id: Option<u64>,
+    },
     Simulate {
         #[arg(long)]
         config: PathBuf,

@@ -41,11 +41,14 @@ These protections prevent the bot from quietly turning a mint configuration into
 - Monitors every new block through WebSocket instead of polling a timer.
 - Prepares configuration, ABI, calldata, gas strategy, balance checks, and subscriptions before `BOT ARMED`.
 - Refreshes dynamic fee fields while waiting.
-- Overlaps the final OpenSea transaction build and fee estimate at the trigger.
+- Overlaps the final OpenSea transaction build, normal-mode fee/balance reads, and just-in-time nonce selection at the trigger.
+- Keeps block and event monitoring responsive during aggressive-mode cache refreshes; only one refresh runs at a time, and its completion overlaps the OpenSea request.
 - Supports normal and aggressive OpenSea execution modes for public, GTD, and FCFS stages.
 - Refreshes the OpenSea stage schedule while waiting in automatic OpenSea mode.
 - Reuses one OpenSea HTTP client and retries transient transaction-build responses with bounded backoff.
 - Broadcasts identical signed bytes concurrently through the validated WebSocket and HTTP endpoints.
+- Deduplicates identical HTTP RPC URLs across primary, backup, and broadcast settings to avoid repeated requests to the same endpoint.
+- Prints trigger-to-send and trigger-to-acknowledgement latency immediately after submission.
 - Reconnects WebSocket subscriptions and backfills missed event logs after a transport interruption.
 - Supports bounded transaction replacement with the same nonce when explicitly enabled.
 
@@ -344,7 +347,15 @@ The RPC benchmark tests the generic `HTTP_RPC_URL` and `WS_RPC_URL` pair:
 ./target/release/nft-mint-bot rpc-test
 ```
 
-If you use only a network-specific profile, the interactive startup in Step 10 validates that profile instead. It checks chain IDs, deployed contract bytecode, wallet balance, WebSocket subscriptions, and every usable broadcast endpoint before printing `BOT ARMED`.
+To benchmark the same network-specific profile that a mint uses, pass its chain ID:
+
+```bash
+./target/release/nft-mint-bot rpc-test --chain-id 4663
+./target/release/nft-mint-bot rpc-test --chain-id 57073
+./target/release/nft-mint-bot rpc-test --chain-id 999
+```
+
+The interactive startup in Step 10 checks chain IDs, deployed contract bytecode, wallet balance, WebSocket subscriptions, and every usable broadcast endpoint before printing `BOT ARMED`.
 
 ### Step 10 — Configure one mint path and make it `BOT ARMED`
 
@@ -535,8 +546,22 @@ The automatic schedule refreshes every 30 seconds normally and every 5 seconds w
 
 ### Step 13 — Choose normal or aggressive OpenSea execution
 
-- `normal` is recommended. It obtains fresh fees, performs live gas simulation, checks balance, and selects the nonce just before signing.
-- `aggressive` minimizes trigger-path RPC work. It continuously prewarms fee, nonce, and balance data, uses the configured gas limit, and skips live gas simulation plus the final balance RPC.
+- `normal` is recommended. It starts the fresh OpenSea build, fee lookup, balance lookup, and just-in-time nonce lookup concurrently. Live gas simulation follows using the validated calldata and updated fees, then the exact payment and gas are checked against the balance and configured limits.
+- `aggressive` minimizes trigger-path RPC work. It prewarms fee, nonce, and balance data without blocking block/event monitoring, uses the configured gas limit, and skips live gas simulation plus the final balance RPC (except Ink's required live surcharge/balance check). If a refresh is in flight at the trigger, it overlaps the OpenSea build; refreshed fields must be valid before signing.
+
+Both modes hold the wallet nonce lock from trigger preparation through broadcast acknowledgement. A competing local process forces a fresh pending-nonce lookup. Final bytecode-pin and Ink fee-budget checks run concurrently immediately before signing. No gas limits, payment caps, or fees are automatically increased by these latency optimizations.
+
+The latency report is printed as soon as an RPC acknowledges the transaction. `Trigger preparation` includes readiness checks, OpenSea, and nonce work; `Trigger → send-ready` includes all work from the observed trigger through signing. RPC acknowledgement is separate from block inclusion. The local `benchmark` command measures CPU work only, so use the real run's latency report to assess network delays.
+
+For a reproducible, transaction-free comparison of preparation ordering with mock services taking 100 ms per operation:
+
+```bash
+cargo +1.94.1 test --locked --lib mocked_opensea_latency_comparison -- --nocapture
+```
+
+This comparison excludes real OpenSea variability, network propagation, and block inclusion. Aggressive mode's comparison covers a trigger arriving during a cache refresh; a trigger with an already warm cache has no refresh wait to remove.
+
+See [measured performance and RPC observations](PERFORMANCE.md) for the controlled comparison, live read-only probes, and validation results.
 
 Aggressive mode still enforces eligibility, calldata, payment, gas-cost, and balance guards, but it carries more risk: changed on-chain state or an insufficient fixed gas limit can produce a reverted transaction that still consumes gas. It requires explicit `gas.gas_limit` and `gas.max_total_gas_cost_native` values.
 
@@ -753,7 +778,7 @@ Nonce modes are:
 
 - `preloaded`: lowest trigger latency, but do not send another transaction from that wallet while armed.
 - `refresh_each_block`: refreshes and uses the pending nonce from each block; do not send another wallet transaction between the final refresh and the trigger.
-- `just_before_trigger`: obtains the pending nonce after the trigger wins and immediately before signing.
+- `just_before_trigger`: obtains a fresh pending nonce under the wallet lock during trigger preparation, concurrently with preflight/OpenSea work. The lock remains held through broadcast acknowledgement.
 
 Ctrl+C stops an armed monitor without submitting. After a transaction has been submitted, Ctrl+C stops receipt monitoring but cannot cancel the blockchain transaction; keep the printed hash for independent tracking.
 

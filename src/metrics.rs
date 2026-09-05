@@ -42,7 +42,7 @@ impl LatencyMetrics {
         println!("\nLATENCY REPORT");
         println!("--------------------------------");
         println!(
-            "Trigger evaluation       {:.3} ms",
+            "Trigger preparation      {:.3} ms",
             elapsed_ms(self.trigger_validated, self.trigger_evaluation_started)
         );
         println!(
@@ -63,12 +63,18 @@ impl LatencyMetrics {
         }
         if let Some(total) = self.local_critical_path() {
             println!(
-                "\nLocal critical path      {:.3} ms",
+                "\nValidated → send-ready   {:.3} ms",
                 total.as_secs_f64() * 1_000.0
             );
             if let (Some(start), Some(end)) = (self.broadcast_started, self.first_rpc_response) {
                 println!("RPC/network latency      {:.3} ms", elapsed_ms(end, start));
             }
+        }
+        if let Some(started) = self.broadcast_started {
+            println!(
+                "Trigger → send-ready      {:.3} ms",
+                elapsed_ms(started, self.message_received)
+            );
         }
         if let Some(response) = self.first_rpc_response {
             println!(

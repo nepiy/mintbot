@@ -14,6 +14,7 @@ use alloy::{
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use reqwest::Url;
 use std::{
+    collections::HashSet,
     env,
     sync::Arc,
     time::{Duration, Instant},
@@ -161,7 +162,10 @@ impl RpcClients {
         let ws_connect_latency = ws_started.elapsed();
 
         let mut broadcast = vec![("primary".to_string(), http.clone())];
-        if let Some(backup) = optional_env(&backup_name) {
+        let mut seen_urls = HashSet::from([validate_rpc_url(&http_name, &http_url, false)?]);
+        if let Some(backup) = optional_env(&backup_name)
+            && register_http_endpoint(&mut seen_urls, &backup_name, &backup)?
+        {
             broadcast.push((
                 "backup".to_string(),
                 connect_http(&backup_name, &backup).await?,
@@ -174,6 +178,9 @@ impl RpcClients {
                 .filter(|item| !item.is_empty())
                 .enumerate()
             {
+                if !register_http_endpoint(&mut seen_urls, &broadcast_name, url)? {
+                    continue;
+                }
                 broadcast.push((
                     format!("broadcast-{index}"),
                     connect_http(&broadcast_name, url).await?,
@@ -682,6 +689,12 @@ async fn connect_http(name: &str, url: &str) -> Result<DynProvider<Ethereum>> {
     Ok(ProviderBuilder::new().connect_http(parsed).erased())
 }
 
+fn register_http_endpoint(seen: &mut HashSet<Url>, name: &str, url: &str) -> Result<bool> {
+    // Compare the complete normalized URL, including path and query. Distinct
+    // provider routes/credentials on the same host remain independent endpoints.
+    Ok(seen.insert(validate_rpc_url(name, url, false)?))
+}
+
 async fn connect_ws(name: &str, url: &str) -> Result<DynProvider<Ethereum>> {
     let parsed = validate_rpc_url(name, url, true)?;
     ProviderBuilder::new()
@@ -816,34 +829,55 @@ pub(crate) mod tests {
     pub(crate) async fn mock_rpc(
         response: fn(serde_json::Value) -> serde_json::Value,
     ) -> (RpcClients, tokio::task::JoinHandle<()>) {
+        mock_rpc_async(move |request| std::future::ready(response(request))).await
+    }
+
+    pub(crate) async fn mock_rpc_async<F, Fut>(
+        response: F,
+    ) -> (RpcClients, tokio::task::JoinHandle<()>)
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = serde_json::Value> + Send + 'static,
+    {
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        let response = Arc::new(response);
         let task = tokio::spawn(async move {
+            let mut handlers = tokio::task::JoinSet::new();
             loop {
-                let (socket, _) = listener.accept().await.unwrap();
-                let mut reader = BufReader::new(socket);
-                let mut length = 0;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).await.unwrap();
-                    if line == "\r\n" {
-                        break;
+                tokio::select! {
+                    joined = handlers.join_next(), if !handlers.is_empty() => {
+                        joined.unwrap().unwrap();
                     }
-                    if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
-                        length = value.trim().parse::<usize>().unwrap();
+                    socket = listener.accept() => {
+                        let (socket, _) = socket.unwrap();
+                        let response = response.clone();
+                        handlers.spawn(async move {
+                            let mut reader = BufReader::new(socket);
+                            let mut length = 0;
+                            loop {
+                                let mut line = String::new();
+                                assert_ne!(reader.read_line(&mut line).await.unwrap(), 0);
+                                if line == "\r\n" {
+                                    break;
+                                }
+                                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                                    length = value.trim().parse::<usize>().unwrap();
+                                }
+                            }
+                            let mut body = vec![0; length];
+                            reader.read_exact(&mut body).await.unwrap();
+                            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            let result = response(request.clone()).await;
+                            let body = serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result}).to_string();
+                            // Cancellation is expected in racing/failed-read tests.
+                            let _ = reader.get_mut().write_all(format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                            ).as_bytes()).await;
+                        });
                     }
                 }
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).await.unwrap();
-                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
-                let result = response(request.clone());
-                let body =
-                    serde_json::json!({"jsonrpc":"2.0", "id":request["id"], "result":result})
-                        .to_string();
-                reader.get_mut().write_all(format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
-                ).as_bytes()).await.unwrap();
             }
         });
         let provider = connect_http("test", &url).await.unwrap();
@@ -899,6 +933,18 @@ pub(crate) mod tests {
         let (rpc, server) = mock_rpc(|_| serde_json::json!("0x")).await;
         assert!(rpc.ink_extra_fee_reserve(100, 200_000).await.is_err());
         server.abort();
+    }
+
+    #[test]
+    fn duplicate_rpc_urls_are_removed_without_collapsing_distinct_routes() {
+        let mut seen = HashSet::new();
+        assert!(register_http_endpoint(&mut seen, "test", "https://rpc.example").unwrap());
+        assert!(!register_http_endpoint(&mut seen, "test", "https://rpc.example/").unwrap());
+        assert!(register_http_endpoint(&mut seen, "test", "https://rpc.example/route-a").unwrap());
+        assert!(register_http_endpoint(&mut seen, "test", "https://rpc.example/route-b").unwrap());
+        assert!(register_http_endpoint(&mut seen, "test", "https://rpc.example/?route=a").unwrap());
+        assert!(register_http_endpoint(&mut seen, "test", "https://rpc.example/?route=b").unwrap());
+        assert!(register_http_endpoint(&mut seen, "test", "http://rpc.example").is_err());
     }
 
     #[test]

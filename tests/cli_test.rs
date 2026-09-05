@@ -8,6 +8,23 @@ fn no_subcommand_selects_interactive_startup() {
 }
 
 #[test]
+fn rpc_benchmark_can_select_the_mint_network_profile() {
+    use nft_mint_bot::cli::Command;
+    let cli = Cli::try_parse_from(["nft-mint-bot", "rpc-test", "--chain-id", "999"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::RpcTest {
+            chain_id: Some(999)
+        })
+    ));
+    let cli = Cli::try_parse_from(["nft-mint-bot", "rpc-test"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Some(Command::RpcTest { chain_id: None })
+    ));
+}
+
+#[test]
 fn startup_does_not_load_a_parent_dotenv() {
     let directory = tempfile::tempdir().unwrap();
     let child = directory.path().join("child");
