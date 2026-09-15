@@ -97,6 +97,7 @@ impl Fixture {
             opensea_client: None,
             auto_opensea_schedule: false,
             opensea_schedule: None,
+            last_breakdown: crate::metrics::PreparationBreakdown::default(),
         }
     }
 

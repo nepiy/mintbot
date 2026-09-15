@@ -5,7 +5,7 @@ use crate::{
         parse_native_amount,
     },
     error::{BotError, Result},
-    metrics::LatencyMetrics,
+    metrics::{LatencyMetrics, PreparationBreakdown},
     opensea::{
         OPENSEA_SEADROP_ADDRESS, OpenSeaClient, OpenSeaDrop, OpenSeaMintTransaction, OpenSeaStage,
         spawn_schedule_refresh, validate_seadrop_calldata,
@@ -193,6 +193,7 @@ async fn run_bot_with_config(
         opensea_client: opensea_client.as_ref(),
         auto_opensea_schedule,
         opensea_schedule,
+        last_breakdown: PreparationBreakdown::default(),
     };
     let result = monitor_until_trigger(&mut monitor, streams).await;
     if let Some(task) = opensea_schedule_task {
@@ -432,7 +433,7 @@ async fn hydrate_opensea_transaction_with_client(
     let Some(drop_slug) = config.opensea_drop_slug.as_deref() else {
         return Ok(());
     };
-    let inputs = fetch_opensea_inputs(
+    let (inputs, _) = fetch_opensea_inputs(
         config,
         rpc,
         wallet.address,
@@ -453,34 +454,64 @@ async fn fetch_opensea_inputs(
     rpc: &RpcClients,
     wallet: Address,
     build_mint: impl std::future::Future<Output = Result<OpenSeaMintTransaction>>,
-) -> Result<OpenSeaInputs> {
+) -> Result<(OpenSeaInputs, PreparationBreakdown)> {
+    let build_mint_timed = async {
+        let started = Instant::now();
+        let mint = build_mint.await?;
+        Ok((mint, started.elapsed().as_secs_f64() * 1000.0))
+            as Result<(OpenSeaMintTransaction, f64)>
+    };
     let estimate_fees = async {
-        if matches!(config.gas.mode, GasMode::Auto) && !is_aggressive_opensea(config) {
+        let started = Instant::now();
+        let fees = if matches!(config.gas.mode, GasMode::Auto) && !is_aggressive_opensea(config) {
             let mut estimation = rpc.estimate_eip1559_fees().await?;
             estimation.max_fee_per_gas =
                 scale_u128(estimation.max_fee_per_gas, config.gas.multiplier)?;
             estimation.max_priority_fee_per_gas =
                 scale_u128(estimation.max_priority_fee_per_gas, config.gas.multiplier)?;
-            Ok(Some(estimation))
+            Some(estimation)
         } else {
-            Ok(None)
-        }
+            None
+        };
+        Ok((fees, Some(started.elapsed().as_secs_f64() * 1000.0)))
+            as Result<(Option<Eip1559Estimation>, Option<f64>)>
     };
     let balance = async {
-        if is_aggressive_opensea(config) {
-            Ok(None)
+        let started = Instant::now();
+        let balance = if is_aggressive_opensea(config) {
+            None
         } else {
-            rpc.check_balance(wallet).await.map(Some)
-        }
+            rpc.check_balance(wallet).await.map(Some)?
+        };
+        Ok((balance, Some(started.elapsed().as_secs_f64() * 1000.0)))
+            as Result<(Option<U256>, Option<f64>)>
     };
     // Balance is independent of calldata and gas. Start all three reads at
     // the trigger, then validate the exact final payment and gas below.
-    let (mint, fees, balance) = tokio::try_join!(build_mint, estimate_fees, balance)?;
-    Ok(OpenSeaInputs {
-        mint,
-        fees,
-        balance,
-    })
+    let ((mint, opensea_ms), (fees, fees_ms), (balance, balance_ms)) =
+        tokio::try_join!(build_mint_timed, estimate_fees, balance)?;
+    // Aggressive mode intentionally skips live fee/balance reads; mark them
+    // as skipped so the latency report distinguishes them from 0 ms reads.
+    let (fees_ms, balance_ms) = if is_aggressive_opensea(config) {
+        (None, None)
+    } else {
+        (fees_ms, balance_ms)
+    };
+    let breakdown = PreparationBreakdown {
+        opensea_ms: Some(opensea_ms),
+        fees_ms,
+        balance_ms,
+        gas_ms: None,
+        nonce_ms: None,
+    };
+    Ok((
+        OpenSeaInputs {
+            mint,
+            fees,
+            balance,
+        },
+        breakdown,
+    ))
 }
 
 async fn apply_opensea_inputs(
@@ -706,6 +737,7 @@ struct MonitorContext<'a> {
     opensea_client: Option<&'a OpenSeaClient>,
     auto_opensea_schedule: bool,
     opensea_schedule: Option<watch::Receiver<Vec<OpenSeaStage>>>,
+    last_breakdown: PreparationBreakdown,
 }
 
 enum MonitorStreams {
@@ -1175,6 +1207,7 @@ async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bo
     if context.dry_run {
         return prepare_trigger_transaction(context).await;
     }
+    context.last_breakdown = PreparationBreakdown::default();
     // Hold the same cross-process lock through preparation, signing and RPC
     // acknowledgement. The pending nonce can now overlap preflight/OpenSea
     // instead of adding another round trip after they finish.
@@ -1185,13 +1218,18 @@ async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bo
         || !uses_cached_nonce(context.config)
         || lock.was_contended();
     let nonce = async {
-        if refresh_nonce {
-            rpc.preload_nonce(wallet).await.map(Some)
+        let started = Instant::now();
+        let nonce = if refresh_nonce {
+            rpc.preload_nonce(wallet).await.map(Some)?
         } else {
-            Ok(None)
-        }
+            None
+        };
+        Ok((nonce, refresh_nonce.then(|| started.elapsed().as_secs_f64() * 1000.0)))
+            as Result<(Option<u64>, Option<f64>)>
     };
-    let (ready, nonce) = tokio::try_join!(prepare_trigger_transaction(context), nonce)?;
+    let (ready, (nonce, nonce_ms)) =
+        tokio::try_join!(prepare_trigger_transaction(context), nonce)?;
+    context.last_breakdown.nonce_ms = nonce_ms;
     if ready {
         if let Some(nonce) = nonce {
             context.prepared.request.set_nonce(nonce);
@@ -1225,7 +1263,12 @@ async fn prepare_trigger_transaction(context: &mut MonitorContext<'_>) -> Result
             let Some(inputs) = fetch_trigger_opensea_inputs(context, build_mint).await? else {
                 return Ok(false);
             };
+            let gas_started = Instant::now();
             apply_opensea_inputs(config, &rpc, wallet, context.prepared, inputs).await?;
+            let gas_ms = gas_started.elapsed().as_secs_f64() * 1000.0;
+            // Aggressive mode uses a fixed limit, so its gas step is local
+            // validation only; normal mode just ran eth_estimateGas above.
+            context.last_breakdown.gas_ms = Some(gas_ms);
             Ok(true)
         }
         .await;
@@ -1332,8 +1375,11 @@ async fn fetch_trigger_opensea_inputs(
 ) -> Result<Option<OpenSeaInputs>> {
     let rpc = context.rpc.clone();
     let inputs = fetch_opensea_inputs(context.config, &rpc, context.wallet.address, build_mint);
-    let (inputs, healthy) =
+    let ((inputs, breakdown), healthy) =
         tokio::try_join!(inputs, async { Ok(ensure_dynamic_fields(context).await) })?;
+    context.last_breakdown.opensea_ms = breakdown.opensea_ms;
+    context.last_breakdown.fees_ms = breakdown.fees_ms;
+    context.last_breakdown.balance_ms = breakdown.balance_ms;
     Ok(healthy.then_some(inputs))
 }
 
@@ -1713,6 +1759,7 @@ async fn execute_transaction(
     metrics.trigger_evaluation_started = timing.received;
     metrics.trigger_validated = timing.validated;
     metrics.trigger_acquired = timing.acquired;
+    metrics.preparation = context.last_breakdown;
     if context.dry_run {
         println!("\nTRIGGER DETECTED");
         println!("\nDry-run enabled.\nTransaction NOT submitted.");

@@ -1,11 +1,21 @@
 use std::time::{Duration, Instant};
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PreparationBreakdown {
+    pub opensea_ms: Option<f64>,
+    pub fees_ms: Option<f64>,
+    pub balance_ms: Option<f64>,
+    pub gas_ms: Option<f64>,
+    pub nonce_ms: Option<f64>,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LatencyMetrics {
     pub message_received: Instant,
     pub trigger_evaluation_started: Instant,
     pub trigger_validated: Instant,
     pub trigger_acquired: Instant,
+    pub preparation: PreparationBreakdown,
     pub finalization_started: Option<Instant>,
     pub finalization_completed: Option<Instant>,
     pub signing_started: Option<Instant>,
@@ -21,6 +31,7 @@ impl LatencyMetrics {
             trigger_evaluation_started: message_received,
             trigger_validated: message_received,
             trigger_acquired: message_received,
+            preparation: PreparationBreakdown::default(),
             finalization_started: None,
             finalization_completed: None,
             signing_started: None,
@@ -44,6 +55,30 @@ impl LatencyMetrics {
         println!(
             "Trigger preparation      {:.3} ms",
             elapsed_ms(self.trigger_validated, self.trigger_evaluation_started)
+        );
+        let breakdown = |value: Option<f64>| match value {
+            Some(ms) => format!("{ms:.3} ms"),
+            None => "skipped".to_string(),
+        };
+        println!(
+            "  opensea build_mint      {}",
+            breakdown(self.preparation.opensea_ms)
+        );
+        println!(
+            "  rpc fees (feeHistory)   {}",
+            breakdown(self.preparation.fees_ms)
+        );
+        println!(
+            "  rpc balance (getBalance){}",
+            breakdown(self.preparation.balance_ms)
+        );
+        println!(
+            "  rpc gas (estimateGas)   {}",
+            breakdown(self.preparation.gas_ms)
+        );
+        println!(
+            "  rpc nonce (getTxCount)  {}",
+            breakdown(self.preparation.nonce_ms)
         );
         println!(
             "Atomic state transition  {:.3} ms",
