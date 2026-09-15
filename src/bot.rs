@@ -1224,11 +1224,12 @@ async fn ensure_transaction_ready(context: &mut MonitorContext<'_>) -> Result<bo
         } else {
             None
         };
-        Ok((nonce, refresh_nonce.then(|| started.elapsed().as_secs_f64() * 1000.0)))
-            as Result<(Option<u64>, Option<f64>)>
+        Ok((
+            nonce,
+            refresh_nonce.then(|| started.elapsed().as_secs_f64() * 1000.0),
+        )) as Result<(Option<u64>, Option<f64>)>
     };
-    let (ready, (nonce, nonce_ms)) =
-        tokio::try_join!(prepare_trigger_transaction(context), nonce)?;
+    let (ready, (nonce, nonce_ms)) = tokio::try_join!(prepare_trigger_transaction(context), nonce)?;
     context.last_breakdown.nonce_ms = nonce_ms;
     if ready {
         if let Some(nonce) = nonce {
