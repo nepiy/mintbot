@@ -47,23 +47,25 @@ fn gas_defaults(chain_id: u64) -> (Option<u64>, &'static str) {
     }
 }
 
-fn ask_abstract_gas_limit(required: bool) -> Result<Option<u64>> {
+fn ask_tested_gas_limit(chain_name: &str, required: bool) -> Result<Option<u64>> {
     let prompt = if required {
-        "Tested Abstract gas limit (required for aggressive mode)"
+        format!("Tested {chain_name} gas limit (required for aggressive mode)")
     } else {
-        "Tested Abstract gas limit (blank to estimate; closed sales may require a tested limit)"
+        format!(
+            "Tested {chain_name} gas limit (blank to estimate; closed sales may require a tested limit)"
+        )
     };
-    let value = ask(prompt, "")?;
+    let value = ask(&prompt, "")?;
     if value.trim().is_empty() && !required {
         return Ok(None);
     }
     let limit = value.trim().parse::<u64>().map_err(|_| {
-        BotError::Config("Abstract gas limit must be a positive integer".to_string())
+        BotError::Config(format!("{chain_name} gas limit must be a positive integer"))
     })?;
     if limit == 0 {
-        return Err(BotError::Config(
-            "Abstract gas limit must be greater than zero".to_string(),
-        ));
+        return Err(BotError::Config(format!(
+            "{chain_name} gas limit must be greater than zero"
+        )));
     }
     Ok(Some(limit))
 }
@@ -190,10 +192,16 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
                 ));
             }
         };
-        let gas_limit = if chain_id == ABSTRACT_MAINNET_CHAIN_ID
+        let gas_limit = if (chain_id == ABSTRACT_MAINNET_CHAIN_ID
+            || chain_id == ARC_MAINNET_CHAIN_ID)
             && matches!(opensea_execution_mode, OpenSeaExecutionMode::Aggressive)
         {
-            ask_abstract_gas_limit(true)?
+            let chain_name = if chain_id == ABSTRACT_MAINNET_CHAIN_ID {
+                "Abstract"
+            } else {
+                "Arc"
+            };
+            ask_tested_gas_limit(chain_name, true)?
         } else {
             default_gas_limit
         };
@@ -291,7 +299,7 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         )
     };
     let gas_limit = if chain_id == ABSTRACT_MAINNET_CHAIN_ID {
-        ask_abstract_gas_limit(false)?
+        ask_tested_gas_limit("Abstract", false)?
     } else if allow_manual {
         Some(
             ask(
