@@ -569,17 +569,7 @@ async fn apply_opensea_inputs(
     };
 
     let gas_limit = if is_aggressive_opensea(config) {
-        let configured = config
-            .gas
-            .gas_limit
-            .or(prepared.request.gas)
-            .ok_or_else(|| {
-                BotError::Config(
-                "aggressive OpenSea mode requires gas.gas_limit because gas estimation is skipped"
-                    .to_string(),
-            )
-            })?;
-        scale_u64(configured, config.gas.multiplier)?
+        aggressive_opensea_gas_limit(config, prepared)?
     } else {
         let estimated_gas = rpc.estimate_gas(request.clone()).await.map_err(|err| {
             BotError::Transaction(format!(
@@ -2182,6 +2172,25 @@ fn select_opensea_gas_limit(
     scale_u64(base, multiplier)
 }
 
+fn aggressive_opensea_gas_limit(
+    config: &MintConfig,
+    prepared: &PreparedTransaction,
+) -> Result<u64> {
+    // prepare_transaction has already applied the multiplier to a configured
+    // limit. Reuse that prepared value so the hydration path cannot apply the
+    // multiplier a second time when OpenSea returns its calldata.
+    if let Some(prepared_limit) = prepared.request.gas.filter(|limit| *limit > 0) {
+        return Ok(prepared_limit);
+    }
+    let configured = config.gas.gas_limit.ok_or_else(|| {
+        BotError::Config(
+            "aggressive OpenSea mode requires gas.gas_limit because gas estimation is skipped"
+                .to_string(),
+        )
+    })?;
+    scale_u64(configured, config.gas.multiplier)
+}
+
 fn scale_u128(value: u128, multiplier: f64) -> Result<u128> {
     let scaled = (value as f64 * multiplier).ceil();
     if !scaled.is_finite() || scaled > u128::MAX as f64 {
@@ -2238,14 +2247,26 @@ fn print_armed(
         );
     }
     println!("Wallet: {}", short_address(wallet.address));
+    let native_currency = config.native_currency.as_deref().unwrap_or(
+        if config.chain_id == crate::config::ARC_MAINNET_CHAIN_ID {
+            "USDC"
+        } else {
+            "native currency"
+        },
+    );
     if prepared.gas_limit == 0 {
         println!("Gas limit and final gas/balance budget: DEFERRED until OpenSea hydration");
     } else {
         println!("Gas limit: {}", prepared.gas_limit);
     }
-    println!("Current maximum fee: {} wei/gas", prepared.fee_cap);
+    let fee_unit = if config.chain_id == crate::config::ARC_MAINNET_CHAIN_ID {
+        "USDC base units/gas"
+    } else {
+        "wei/gas"
+    };
+    println!("Current maximum fee: {} {fee_unit}", prepared.fee_cap);
     if let Some(maximum) = config.gas.max_total_gas_cost_native.as_deref() {
-        println!("Pre-broadcast fee budget: {maximum} native currency");
+        println!("Pre-broadcast fee budget: {maximum} {native_currency}");
     }
     if config.chain_id == crate::config::INK_MAINNET_CHAIN_ID {
         println!(
@@ -2542,11 +2563,12 @@ mod tests {
     }
 
     use super::{
-        PreparedTransaction, automatic_opensea_retry_timestamp, ensure_opensea_supply,
-        is_advanceable_opensea_rejection, is_aggressive_opensea, is_ambiguous_opensea_precondition,
-        is_contract_closed_error, is_opensea_stage_not_active_rejection, next_opensea_stage,
-        next_opensea_stage_has_started, refreshed_stage_index, select_opensea_gas_limit,
-        uses_cached_nonce, validate_opensea_mint_value, validate_signing_request,
+        PreparedTransaction, aggressive_opensea_gas_limit, automatic_opensea_retry_timestamp,
+        ensure_opensea_supply, is_advanceable_opensea_rejection, is_aggressive_opensea,
+        is_ambiguous_opensea_precondition, is_contract_closed_error,
+        is_opensea_stage_not_active_rejection, next_opensea_stage, next_opensea_stage_has_started,
+        refreshed_stage_index, select_opensea_gas_limit, uses_cached_nonce,
+        validate_opensea_mint_value, validate_signing_request,
         validate_transaction_budget_with_balance,
     };
     use crate::abi::encode_mint;
@@ -2734,6 +2756,32 @@ mod tests {
         assert_eq!(
             select_opensea_gas_limit(150_000, Some(200_000), 1.15).unwrap(),
             230_000
+        );
+    }
+
+    #[test]
+    fn aggressive_opensea_reuses_the_prepared_scaled_gas_limit() {
+        let mut config = opensea_config(true, Some("0"));
+        config.opensea_execution_mode = OpenSeaExecutionMode::Aggressive;
+        config.gas.gas_limit = Some(250_000);
+        config.gas.multiplier = 1.15;
+        config.gas.max_total_gas_cost_native = Some("0.1".to_string());
+
+        let request = TransactionRequest::default().with_gas_limit(287_500);
+        let prepared = PreparedTransaction {
+            request,
+            calldata: Vec::new(),
+            mint_value: U256::ZERO,
+            gas_limit: 287_500,
+            fee_cap: 1,
+            available_balance: U256::MAX,
+            opensea_hydrated: false,
+            force_nonce_refresh: false,
+        };
+
+        assert_eq!(
+            aggressive_opensea_gas_limit(&config, &prepared).unwrap(),
+            287_500
         );
     }
 

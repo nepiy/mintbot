@@ -260,6 +260,8 @@ For Abstract, use `https://api.mainnet.abs.xyz` and `wss://api.mainnet.abs.xyz/w
 
 For Arc, use `https://rpc.mainnet.arc.io` and `wss://rpc.mainnet.arc.io/ws`, included in `.env.example`. Arc uses USDC as the native gas token. See [Arc documentation](https://www.arc.io).
 
+For Arc OpenSea Drops, normal mode estimates the gas for the exact SeaDrop calldata returned for the active stage. Aggressive mode asks for a positive, tested gas limit and skips the trigger-time gas simulation; keep the explicit `max_total_gas_cost_native` budget in USDC. Arc fee values use the chain's 18-decimal native accounting even though USDC balances are commonly displayed with 6 decimals.
+
 ### Abstract quick start
 
 Add these lines to your existing `.env`:
@@ -453,17 +455,17 @@ Windows PowerShell:
 
 Answer the prompts in this order:
 
-1. Network: `1` for Robinhood Chain, `2` for Ink, `3` for HyperEVM, or `4` for Abstract mainnet.
+1. Network: `1` for Robinhood Chain, `2` for Ink, `3` for HyperEVM, `4` for Abstract mainnet, or `5` for Arc mainnet.
 2. Collection contract address.
 3. OpenSea drop slug.
 4. Quantity.
 5. `yes` for a free-mint guard, or `no` plus the maximum price per NFT.
 6. Execution mode: choose `normal` unless you have deliberately configured and tested `aggressive` mode.
-7. On Abstract, aggressive mode also requires a tested gas limit.
+7. On Abstract or Arc, aggressive mode also requires a tested gas limit.
 
 Use **free-mint = yes** only when the intended stage should send exactly `0` native currency. The guard rejects any nonzero value returned by OpenSea; it does not make gas free. Use **free-mint = no** for a paid stage and enter the maximum price for one NFT, not the total. The bot multiplies that cap by quantity and refuses to sign if OpenSea returns more.
 
-Use **normal** for the first run and for ordinary mints. It performs fresh gas simulation, balance checks, and just-in-time nonce selection. Without a fixed gas limit, OpenSea gas estimation and the final budget check are deferred until eligible SeaDrop calldata is available; the placeholder cannot be signed. Use **aggressive** only for a tested contract when trigger latency is critical and you already know a safe fixed gas limit and fee budget. Aggressive mode skips live gas simulation and normally uses a cached balance. Ink still performs fresh surcharge and balance checks before signing in either mode. A wrong gas limit or changed contract state can still produce a gas-paying revert.
+Use **normal** for the first run and for ordinary mints. It performs fresh gas simulation, balance checks, and just-in-time nonce selection. Without a fixed gas limit, OpenSea gas estimation and the final budget check are deferred until eligible SeaDrop calldata is available; the placeholder cannot be signed. Arc normal mode intentionally has no copied fixed gas default, so the estimate is for the actual Arc transaction returned by OpenSea. Use **aggressive** only for a tested contract when trigger latency is critical and you already know a safe fixed gas limit and fee budget. Aggressive mode skips live gas simulation and normally uses a cached balance. Ink still performs fresh surcharge and balance checks before signing in either mode. A wrong gas limit or changed contract state can still produce a gas-paying revert.
 
 The bot loads active and upcoming stages, skips stages the wallet already used or cannot use, and selects the first eligible stage. Before a stage opens, `OpenSea transaction: DEFERRED until the selected stage is active` is expected. The startup is ready only when you see `Contract: VALID`, `Wallet balance: OK`, `Subscriptions: READY`, and `BOT ARMED`.
 
@@ -812,7 +814,7 @@ The timestamp trigger and OpenSea stage selection, expiry, and retry deadlines u
 
 ### Gas and nonce behavior
 
-Gas modes are `auto`, `eip1559`, `legacy`, and `manual`. Auto mode estimates EIP-1559 fees, applies the configured multiplier, and refreshes fee fields while waiting. `max_total_gas_cost_native` is a pre-broadcast budget, separate from the mint payment. Execution fees are bounded by gas limit multiplied by the transaction's fee cap.
+Gas modes are `auto`, `eip1559`, `legacy`, and `manual`. Auto mode estimates EIP-1559 fees, applies the configured multiplier, and refreshes fee fields while waiting. `max_total_gas_cost_native` is a pre-broadcast budget, separate from the mint payment. Execution fees are bounded by gas limit multiplied by the transaction's fee cap. On Arc, the budget and fee cap are expressed in native USDC units with 18-decimal gas accounting.
 
 On Ink, every initial and replacement signing also checks the live balance and adds twice the oracle's L1 data upper-bound estimate plus twice its operator-fee estimate to the execution budget. If either oracle call is unavailable or malformed, signing stops. The L1 estimate conservatively includes transaction-encoding overhead. These extra fees can change before inclusion, so the budget is **not a guaranteed total-fee cap on-chain**. Keep a margin and use a dedicated low-balance wallet. The receipt's displayed execution fee excludes L2 surcharges. Custom chains with additional fee components require a chain-specific estimator; only Ink's surcharges are currently modeled.
 

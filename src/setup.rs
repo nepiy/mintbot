@@ -1,6 +1,6 @@
 use crate::{
     config::{
-        ABSTRACT_DEFAULT_MAX_GAS_COST_NATIVE, ABSTRACT_MAINNET_CHAIN_ID, ARC_DEFAULT_GAS_LIMIT,
+        ABSTRACT_DEFAULT_MAX_GAS_COST_NATIVE, ABSTRACT_MAINNET_CHAIN_ID,
         ARC_DEFAULT_MAX_GAS_COST_NATIVE, ARC_MAINNET_CHAIN_ID, GasConfig,
         HYPEREVM_DEFAULT_GAS_LIMIT, HYPEREVM_DEFAULT_MAX_GAS_COST_NATIVE,
         HYPEREVM_MAINNET_CHAIN_ID, INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE,
@@ -34,7 +34,11 @@ fn gas_defaults(chain_id: u64) -> (Option<u64>, &'static str) {
         // Abstract estimates include ZK execution and pubdata overhead. Do not
         // reuse a fixed gas limit measured on another network.
         ABSTRACT_MAINNET_CHAIN_ID => (None, ABSTRACT_DEFAULT_MAX_GAS_COST_NATIVE),
-        ARC_MAINNET_CHAIN_ID => (Some(ARC_DEFAULT_GAS_LIMIT), ARC_DEFAULT_MAX_GAS_COST_NATIVE),
+        // Arc's native gas token uses 18-decimal fee accounting and the
+        // SeaDrop call is only known once OpenSea returns stage-specific
+        // calldata. Let normal mode estimate that exact call at hydration.
+        // Aggressive mode still asks for a tested limit below.
+        ARC_MAINNET_CHAIN_ID => (None, ARC_DEFAULT_MAX_GAS_COST_NATIVE),
         INK_MAINNET_CHAIN_ID => (Some(INK_DEFAULT_GAS_LIMIT), INK_DEFAULT_MAX_GAS_COST_NATIVE),
         HYPEREVM_MAINNET_CHAIN_ID => (
             Some(HYPEREVM_DEFAULT_GAS_LIMIT),
@@ -298,8 +302,13 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
                 .collect(),
         )
     };
-    let gas_limit = if chain_id == ABSTRACT_MAINNET_CHAIN_ID {
-        ask_tested_gas_limit("Abstract", false)?
+    let gas_limit = if chain_id == ABSTRACT_MAINNET_CHAIN_ID || chain_id == ARC_MAINNET_CHAIN_ID {
+        let chain_name = if chain_id == ABSTRACT_MAINNET_CHAIN_ID {
+            "Abstract"
+        } else {
+            "Arc"
+        };
+        ask_tested_gas_limit(chain_name, false)?
     } else if allow_manual {
         Some(
             ask(
