@@ -1,6 +1,6 @@
 use crate::{
     config::{
-        ABSTRACT_DEFAULT_MAX_GAS_COST_NATIVE, ABSTRACT_MAINNET_CHAIN_ID,
+        ABSTRACT_DEFAULT_MAX_GAS_COST_NATIVE, ABSTRACT_MAINNET_CHAIN_ID, ARC_DEFAULT_GAS_LIMIT,
         ARC_DEFAULT_MAX_GAS_COST_NATIVE, ARC_MAINNET_CHAIN_ID, GasConfig,
         HYPEREVM_DEFAULT_GAS_LIMIT, HYPEREVM_DEFAULT_MAX_GAS_COST_NATIVE,
         HYPEREVM_MAINNET_CHAIN_ID, INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE,
@@ -37,7 +37,6 @@ fn gas_defaults(chain_id: u64) -> (Option<u64>, &'static str) {
         // Arc's native gas token uses 18-decimal fee accounting and the
         // SeaDrop call is only known once OpenSea returns stage-specific
         // calldata. Let normal mode estimate that exact call at hydration.
-        // Aggressive mode still asks for a tested limit below.
         ARC_MAINNET_CHAIN_ID => (None, ARC_DEFAULT_MAX_GAS_COST_NATIVE),
         INK_MAINNET_CHAIN_ID => (Some(INK_DEFAULT_GAS_LIMIT), INK_DEFAULT_MAX_GAS_COST_NATIVE),
         HYPEREVM_MAINNET_CHAIN_ID => (
@@ -196,16 +195,18 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
                 ));
             }
         };
-        let gas_limit = if (chain_id == ABSTRACT_MAINNET_CHAIN_ID
-            || chain_id == ARC_MAINNET_CHAIN_ID)
+        let gas_limit = if chain_id == ABSTRACT_MAINNET_CHAIN_ID
             && matches!(opensea_execution_mode, OpenSeaExecutionMode::Aggressive)
         {
-            let chain_name = if chain_id == ABSTRACT_MAINNET_CHAIN_ID {
-                "Abstract"
-            } else {
-                "Arc"
-            };
-            ask_tested_gas_limit(chain_name, true)?
+            ask_tested_gas_limit("Abstract", true)?
+        } else if chain_id == ARC_MAINNET_CHAIN_ID
+            && matches!(opensea_execution_mode, OpenSeaExecutionMode::Aggressive)
+        {
+            println!(
+                "Arc aggressive mode: automatic gas limit {} (override gas.gas_limit in JSON after testing)",
+                ARC_DEFAULT_GAS_LIMIT
+            );
+            Some(ARC_DEFAULT_GAS_LIMIT)
         } else {
             default_gas_limit
         };

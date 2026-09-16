@@ -11,17 +11,20 @@ fn isolated_bot(directory: &std::path::Path) -> Command {
 #[test]
 fn arc_opensea_normal_and_aggressive_launcher_configs_validate() {
     let directory = tempfile::tempdir().unwrap();
-    for (mode, limit) in [("normal", ""), ("aggressive", "300000\n")] {
-        isolated_bot(directory.path())
+    for mode in ["normal", "aggressive"] {
+        let assertion = isolated_bot(directory.path())
             .args(["start", "--dry-run"])
             .write_stdin(format!(
-                "5\n0x0000000000000000000000000000000000000001\narchouses\n1\nyes\n{mode}\n{limit}"
+                "5\n0x0000000000000000000000000000000000000001\narchouses\n1\nyes\n{mode}\n"
             ))
             .assert()
             .failure()
             .stdout(contains("Network: Arc mainnet (chain ID 5042)"))
             .stdout(contains(format!("Execution mode: {mode}")))
             .stderr(contains("PRIVATE_KEY is not set"));
+        if mode == "aggressive" {
+            assertion.stdout(contains("Arc aggressive mode: automatic gas limit 300000"));
+        }
     }
 }
 
@@ -42,17 +45,4 @@ fn arc_direct_setup_uses_live_estimation_when_no_tested_limit_is_given() {
     assert_eq!(config.chain_id, 5042);
     assert_eq!(config.native_currency.as_deref(), Some("USDC"));
     assert_eq!(config.gas.gas_limit, None);
-}
-
-#[test]
-fn arc_aggressive_launcher_rejects_missing_tested_limit() {
-    let directory = tempfile::tempdir().unwrap();
-    isolated_bot(directory.path())
-        .args(["start", "--dry-run"])
-        .write_stdin(
-            "5\n0x0000000000000000000000000000000000000001\narchouses\n1\nyes\naggressive\n",
-        )
-        .assert()
-        .failure()
-        .stderr(contains("Arc gas limit must be"));
 }

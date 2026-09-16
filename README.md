@@ -260,7 +260,7 @@ For Abstract, use `https://api.mainnet.abs.xyz` and `wss://api.mainnet.abs.xyz/w
 
 For Arc, use `https://rpc.mainnet.arc.io` and `wss://rpc.mainnet.arc.io/ws`, included in `.env.example`. Arc uses USDC as the native gas token. See [Arc documentation](https://www.arc.io).
 
-For Arc OpenSea Drops, normal mode estimates the gas for the exact SeaDrop calldata returned for the active stage. Aggressive mode asks for a positive, tested gas limit and skips the trigger-time gas simulation; keep the explicit `max_total_gas_cost_native` budget in USDC. Arc fee values use the chain's 18-decimal native accounting even though USDC balances are commonly displayed with 6 decimals.
+For Arc OpenSea Drops, normal mode estimates the gas for the exact SeaDrop calldata returned for the active stage. Aggressive mode uses an automatic `300000` gas limit by default and skips trigger-time gas simulation; advanced JSON configurations can override it after testing. Keep the explicit `max_total_gas_cost_native` budget in USDC. Arc fee values use the chain's 18-decimal native accounting even though USDC balances are commonly displayed with 6 decimals.
 
 ### Abstract quick start
 
@@ -461,7 +461,7 @@ Answer the prompts in this order:
 4. Quantity.
 5. `yes` for a free-mint guard, or `no` plus the maximum price per NFT.
 6. Execution mode: choose `normal` unless you have deliberately configured and tested `aggressive` mode.
-7. On Abstract or Arc, aggressive mode also requires a tested gas limit.
+7. On Abstract, aggressive mode requires a tested gas limit. Arc aggressive mode selects `300000` automatically; override it in advanced JSON after testing if needed.
 
 Use **free-mint = yes** only when the intended stage should send exactly `0` native currency. The guard rejects any nonzero value returned by OpenSea; it does not make gas free. Use **free-mint = no** for a paid stage and enter the maximum price for one NFT, not the total. The bot multiplies that cap by quantity and refuses to sign if OpenSea returns more.
 
