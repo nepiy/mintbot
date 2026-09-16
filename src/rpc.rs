@@ -120,6 +120,7 @@ impl RpcClients {
             crate::config::INK_MAINNET_CHAIN_ID => "INK_",
             crate::config::HYPEREVM_MAINNET_CHAIN_ID => "HYPEREVM_",
             crate::config::ABSTRACT_MAINNET_CHAIN_ID => "ABSTRACT_",
+            crate::config::ARC_MAINNET_CHAIN_ID => "ARC_",
             _ => "",
         };
         Self::connect_from_env_with_profile(profile).await

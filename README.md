@@ -10,6 +10,7 @@ The interactive launcher supports:
 - Ink mainnet — chain ID `57073`
 - HyperEVM mainnet — chain ID `999` (native gas token: HYPE)
 - Abstract mainnet — chain ID `2741` (native gas token: ETH)
+- Arc mainnet — chain ID `5042` (native gas token: USDC)
 
 Advanced JSON configurations can target other EVM-compatible networks by providing the correct chain ID, RPC endpoints, contract address, mint ABI, and trigger.
 
@@ -247,6 +248,7 @@ The interactive launcher supports these profiles:
 | Ink mainnet | `57073` | `INK_HTTP_RPC_URL`, `INK_WS_RPC_URL` |
 | HyperEVM mainnet | `999` | `HYPEREVM_HTTP_RPC_URL`, `HYPEREVM_WS_RPC_URL` |
 | Abstract mainnet | `2741` | `ABSTRACT_HTTP_RPC_URL`, `ABSTRACT_WS_RPC_URL` |
+| Arc mainnet | `5042` | `ARC_HTTP_RPC_URL`, `ARC_WS_RPC_URL` |
 
 If either network-specific HTTP or WebSocket variable is filled, that profile is selected and both values must be valid. If a selected network has no profile values, the bot falls back to `HTTP_RPC_URL` and `WS_RPC_URL`.
 
@@ -255,6 +257,8 @@ The included `.env.example` contains Ink’s public HTTPS and WebSocket endpoint
 For HyperEVM, the official HTTPS endpoint is `https://rpc.hyperliquid.xyz/evm` and HYPE is the native gas token. Hyperliquid’s official endpoint does not provide WebSocket JSON-RPC, so configure `HYPEREVM_WS_RPC_URL` with a WSS-capable HyperEVM provider for block monitoring. Keep `HYPEREVM_HTTP_RPC_URL` and any backup/broadcast URLs on HyperEVM. See [Hyperliquid HyperEVM documentation](https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/hyperevm).
 
 For Abstract, use `https://api.mainnet.abs.xyz` and `wss://api.mainnet.abs.xyz/ws`, included in `.env.example`. See [Abstract network details](https://docs.abs.xyz/connect-to-abstract). Add the `ABSTRACT_` profile to an existing `.env` to keep using your Robinhood endpoints when you switch back. The bot signs with the EOA derived from `PRIVATE_KEY`; fund that address with ETH on Abstract. Abstract Global Wallet smart accounts, session keys, and paymasters are not supported by this signer.
+
+For Arc, use `https://rpc.mainnet.arc.io` and `wss://rpc.mainnet.arc.io/ws`, included in `.env.example`. Arc uses USDC as the native gas token. See [Arc documentation](https://www.arc.io).
 
 ### Abstract quick start
 
@@ -355,6 +359,10 @@ ABSTRACT_HTTP_RPC_URL=https://api.mainnet.abs.xyz
 ABSTRACT_WS_RPC_URL=wss://api.mainnet.abs.xyz/ws
 ABSTRACT_BACKUP_RPC_URL=
 ABSTRACT_BROADCAST_RPC_URLS=
+ARC_HTTP_RPC_URL=https://rpc.mainnet.arc.io
+ARC_WS_RPC_URL=wss://rpc.mainnet.arc.io/ws
+ARC_BACKUP_RPC_URL=
+ARC_BROADCAST_RPC_URLS=
 ```
 
 Environment-variable rules:
@@ -384,6 +392,8 @@ To benchmark the same network-specific profile that a mint uses, pass its chain 
 ./target/release/nft-mint-bot rpc-test --chain-id 4663
 ./target/release/nft-mint-bot rpc-test --chain-id 57073
 ./target/release/nft-mint-bot rpc-test --chain-id 999
+./target/release/nft-mint-bot rpc-test --chain-id 2741
+./target/release/nft-mint-bot rpc-test --chain-id 5042
 ```
 
 The interactive startup in Step 10 checks chain IDs, deployed contract bytecode, wallet balance, WebSocket subscriptions, and every usable broadcast endpoint before printing `BOT ARMED`.

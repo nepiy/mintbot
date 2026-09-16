@@ -1,6 +1,7 @@
 use crate::{
     config::{
-        ABSTRACT_DEFAULT_MAX_GAS_COST_NATIVE, ABSTRACT_MAINNET_CHAIN_ID, GasConfig,
+        ABSTRACT_DEFAULT_MAX_GAS_COST_NATIVE, ABSTRACT_MAINNET_CHAIN_ID, ARC_DEFAULT_GAS_LIMIT,
+        ARC_DEFAULT_MAX_GAS_COST_NATIVE, ARC_MAINNET_CHAIN_ID, GasConfig,
         HYPEREVM_DEFAULT_GAS_LIMIT, HYPEREVM_DEFAULT_MAX_GAS_COST_NATIVE,
         HYPEREVM_MAINNET_CHAIN_ID, INK_DEFAULT_GAS_LIMIT, INK_DEFAULT_MAX_GAS_COST_NATIVE,
         INK_MAINNET_CHAIN_ID, MintCallConfig, MintConfig, MintTrigger, NonceStrategy,
@@ -33,6 +34,7 @@ fn gas_defaults(chain_id: u64) -> (Option<u64>, &'static str) {
         // Abstract estimates include ZK execution and pubdata overhead. Do not
         // reuse a fixed gas limit measured on another network.
         ABSTRACT_MAINNET_CHAIN_ID => (None, ABSTRACT_DEFAULT_MAX_GAS_COST_NATIVE),
+        ARC_MAINNET_CHAIN_ID => (Some(ARC_DEFAULT_GAS_LIMIT), ARC_DEFAULT_MAX_GAS_COST_NATIVE),
         INK_MAINNET_CHAIN_ID => (Some(INK_DEFAULT_GAS_LIMIT), INK_DEFAULT_MAX_GAS_COST_NATIVE),
         HYPEREVM_MAINNET_CHAIN_ID => (
             Some(HYPEREVM_DEFAULT_GAS_LIMIT),
@@ -98,16 +100,17 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         (chain_id, None)
     } else {
         println!(
-            "Select network:\n1. Robinhood Chain mainnet\n2. Ink mainnet\n3. HyperEVM mainnet\n4. Abstract mainnet"
+            "Select network:\n1. Robinhood Chain mainnet\n2. Ink mainnet\n3. HyperEVM mainnet\n4. Abstract mainnet\n5. Arc mainnet"
         );
         match ask("Network", "1")?.trim() {
             "1" => (ROBINHOOD_MAINNET_CHAIN_ID, Some("Robinhood Chain mainnet")),
             "2" => (INK_MAINNET_CHAIN_ID, Some("Ink mainnet")),
             "3" => (HYPEREVM_MAINNET_CHAIN_ID, Some("HyperEVM mainnet")),
             "4" => (ABSTRACT_MAINNET_CHAIN_ID, Some("Abstract mainnet")),
+            "5" => (ARC_MAINNET_CHAIN_ID, Some("Arc mainnet")),
             _ => {
                 return Err(BotError::Config(
-                    "network must be 1 (Robinhood), 2 (Ink), 3 (HyperEVM), or 4 (Abstract)"
+                    "network must be 1 (Robinhood), 2 (Ink), 3 (HyperEVM), 4 (Abstract), or 5 (Arc)"
                         .to_string(),
                 ));
             }
@@ -124,6 +127,8 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
             "HyperEVM NFT".to_string()
         } else if chain_id == ABSTRACT_MAINNET_CHAIN_ID {
             "Abstract NFT".to_string()
+        } else if chain_id == ARC_MAINNET_CHAIN_ID {
+            "Arc NFT".to_string()
         } else {
             "Robinhood NFT".to_string()
         }
@@ -195,7 +200,13 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
         let config = MintConfig {
             name,
             chain_id,
-            native_currency: (chain_id == HYPEREVM_MAINNET_CHAIN_ID).then(|| "HYPE".to_string()),
+            native_currency: if chain_id == HYPEREVM_MAINNET_CHAIN_ID {
+                Some("HYPE".to_string())
+            } else if chain_id == ARC_MAINNET_CHAIN_ID {
+                Some("USDC".to_string())
+            } else {
+                None
+            },
             contract_address,
             expected_contract_code_hash: None,
             opensea_drop_slug: Some(opensea_drop_slug),
@@ -339,7 +350,13 @@ fn prompt_config(allow_manual: bool) -> Result<MintConfig> {
     let config = MintConfig {
         name,
         chain_id,
-        native_currency: (chain_id == HYPEREVM_MAINNET_CHAIN_ID).then(|| "HYPE".to_string()),
+        native_currency: if chain_id == HYPEREVM_MAINNET_CHAIN_ID {
+            Some("HYPE".to_string())
+        } else if chain_id == ARC_MAINNET_CHAIN_ID {
+            Some("USDC".to_string())
+        } else {
+            None
+        },
         contract_address,
         expected_contract_code_hash: None,
         opensea_drop_slug: None,
